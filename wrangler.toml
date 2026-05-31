@@ -1,0 +1,38 @@
+name = "workbus-scheduled-runner"
+main = "src/index.ts"
+compatibility_date = "2026-05-31"
+
+[observability]
+enabled = true
+
+[triggers]
+crons = ["17 * * * *"]
+
+[[containers]]
+class_name = "ActionsRunnerContainer"
+image = "./Dockerfile"
+instance_type = "standard-2"
+max_instances = 1
+
+[[durable_objects.bindings]]
+name = "ACTIONS_RUNNER"
+class_name = "ActionsRunnerContainer"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ActionsRunnerContainer"]
+
+[[r2_buckets]]
+binding = "RUN_REPORTS"
+bucket_name = "workbus-run-reports"
+
+[vars]
+RUNNER_REPO = "owner/repo"
+RUNNER_REF = "main"
+RUNNER_WORKFLOW = ".github/workflows/scheduled.yml"
+RUNNER_EVENT_NAME = "schedule"
+RUNNER_TIMEOUT_SECONDS = "900"
+RUNNER_ENABLE_DOCKERD = "1"
+RUNNER_ENABLE_SERVICE_PROBE = "1"
+RUNNER_R2_PREFIX = "runs"
+GITHUB_STATUS_CONTEXT = "workbus/cloudflare-schedule"
