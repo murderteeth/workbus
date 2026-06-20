@@ -73,8 +73,19 @@ export default {
         service: "workbus-scheduled-runner",
         repo: env.RUNNER_REPO,
         ref: env.RUNNER_REF,
-        workflow: env.RUNNER_WORKFLOW
+        workflow: env.RUNNER_WORKFLOW,
+        runs: "/runs"
       });
+    }
+
+    if (request.method === "GET" && url.pathname === "/runs") {
+      return renderRunsList(env);
+    }
+
+    if (request.method === "GET" && url.pathname === "/runs/view") {
+      const key = url.searchParams.get("key");
+      if (!key) return new Response("missing key", { status: 400 });
+      return renderRunDetail(env, key);
     }
 
     if (request.method === "POST" && url.pathname === "/run") {
@@ -278,6 +289,119 @@ function clampInt(value: string | undefined, min: number, max: number, fallback:
   const parsed = Number.parseInt(value || "", 10);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.min(max, Math.max(min, parsed));
+}
+
+async function renderRunsList(env: Env): Promise<Response> {
+  const prefix = (env.RUNNER_R2_PREFIX || "runs").replace(/^\/+|\/+$/g, "") + "/";
+  const listed = await env.RUN_REPORTS.list({ prefix, limit: 1000 });
+  const reportKeys = listed.objects
+    .map((o) => o.key)
+    .filter((k) => k.endsWith("/report.json"))
+    .sort((a, b) => runIdOf(b).localeCompare(runIdOf(a)))
+    .slice(0, 50);
+
+  const reports = await Promise.all(
+    reportKeys.map(async (key) => {
+      const obj = await env.RUN_REPORTS.get(key);
+      if (!obj) return undefined;
+      try {
+        return { key, report: (await obj.json()) as RunnerResult };
+      } catch {
+        return undefined;
+      }
+    })
+  );
+
+  const rows = reports
+    .filter((r): r is { key: string; report: RunnerResult } => Boolean(r))
+    .map(({ key, report }) => {
+      const f = (report.findings || {}) as Record<string, { ok?: boolean }>;
+      return `<tr>
+        <td>${esc(report.startedAt || "")}</td>
+        <td>${esc(report.repo || "")}</td>
+        <td>${esc(report.workflow || "")}</td>
+        <td>${statusBadge(report.status)}</td>
+        <td>${flag(f.docker?.ok)}</td>
+        <td>${flag(f.act?.ok)}</td>
+        <td>${flag(f.serviceContainers?.ok)}</td>
+        <td><a href="/runs/view?key=${encodeURIComponent(key)}">view</a></td>
+      </tr>`;
+    })
+    .join("\n");
+
+  const body = `<h1>workbus runs</h1>
+    <p>${reports.filter(Boolean).length} run(s), newest first.</p>
+    <table>
+      <thead><tr>
+        <th>started</th><th>repo</th><th>workflow</th><th>status</th>
+        <th>docker</th><th>act</th><th>services</th><th></th>
+      </tr></thead>
+      <tbody>${rows || `<tr><td colspan="8">no runs yet</td></tr>`}</tbody>
+    </table>`;
+  return htmlResponse(body);
+}
+
+async function renderRunDetail(env: Env, reportKey: string): Promise<Response> {
+  const reportObj = await env.RUN_REPORTS.get(reportKey);
+  if (!reportObj) return new Response("run not found", { status: 404 });
+  const report = (await reportObj.json()) as RunnerResult;
+
+  const logKey = reportKey.replace(/report\.json$/, "runner.log");
+  const logObj = await env.RUN_REPORTS.get(logKey);
+  const log = logObj ? await logObj.text() : "(no log)";
+
+  const artifactKey = reportKey.replace(/report\.json$/, "artifacts.tgz");
+  const hasArtifact = Boolean(await env.RUN_REPORTS.head(artifactKey));
+
+  const body = `<p><a href="/runs">&larr; all runs</a></p>
+    <h1>${esc(report.repo || "")} ${statusBadge(report.status)}</h1>
+    <p>${esc(report.workflow || "")} @ ${esc(report.ref || "")} &middot;
+       started ${esc(report.startedAt || "")} &middot; exit ${report.exitCode}
+       ${report.headSha ? `&middot; <code>${esc(report.headSha.slice(0, 12))}</code>` : ""}</p>
+    ${hasArtifact ? `<p>artifacts: <code>${esc(artifactKey)}</code> (in R2)</p>` : ""}
+    <h2>findings</h2>
+    <pre>${esc(JSON.stringify(report.findings ?? {}, null, 2))}</pre>
+    <h2>runner.log</h2>
+    <pre>${esc(log)}</pre>`;
+  return htmlResponse(body);
+}
+
+function runIdOf(reportKey: string): string {
+  const parts = reportKey.split("/");
+  return parts[parts.length - 2] || reportKey;
+}
+
+function statusBadge(status?: string): string {
+  const color = status === "success" ? "#1a7f37" : status === "failure" ? "#9a6700" : "#cf222e";
+  return `<span style="color:#fff;background:${color};padding:1px 6px;border-radius:4px">${esc(status || "?")}</span>`;
+}
+
+function flag(ok?: boolean): string {
+  if (ok === undefined) return "·";
+  return ok ? "✅" : "❌";
+}
+
+function esc(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function htmlResponse(body: string): Response {
+  const html = `<!doctype html><html><head><meta charset="utf-8">
+    <title>workbus runs</title>
+    <style>
+      body{font:14px/1.5 system-ui,sans-serif;margin:2rem;color:#1f2328}
+      table{border-collapse:collapse;width:100%}
+      th,td{text-align:left;padding:6px 10px;border-bottom:1px solid #d0d7de}
+      th{background:#f6f8fa}
+      pre{background:#f6f8fa;padding:12px;border-radius:6px;overflow:auto;max-height:32rem}
+      a{color:#0969da}
+      code{background:#eff1f3;padding:1px 4px;border-radius:4px}
+    </style></head><body>${body}</body></html>`;
+  return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
 }
 
 function base64ToBytes(value: string): Uint8Array {

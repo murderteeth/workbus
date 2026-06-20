@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -77,6 +77,14 @@ async function runWorkflow(request) {
     }
     findings.docker = dockerProbe.finding;
 
+    if (findings.docker.ok) {
+      findings.bakedImages = await loadBakedImages({
+        env,
+        log,
+        timeoutMs: remaining(deadline, 120_000)
+      });
+    }
+
     if (request.enableServiceProbe && findings.docker.ok) {
       findings.serviceContainers = await probeServiceContainers({
         env,
@@ -138,7 +146,10 @@ async function runWorkflow(request) {
       "--artifact-server-path",
       artifactsDir,
       "--container-architecture",
-      "linux/amd64"
+      "linux/amd64",
+      "--pull=false",
+      "-P",
+      "ubuntu-latest=node:22-bookworm-slim"
     ];
     if (request.job) {
       actArgs.push("-j", request.job);
@@ -265,6 +276,28 @@ async function ensureDocker({ enabled, env, log, timeoutMs }) {
 
   finding.message = "dockerd did not become ready. This usually means nested Docker needs privileges unavailable to the container runtime.";
   return { finding, process: dockerd, dockerHost };
+}
+
+async function loadBakedImages({ env, log, timeoutMs }) {
+  const dir = "/opt/runner-images";
+  if (!existsSync(dir)) {
+    return { ok: false, skipped: true, message: "no baked image directory" };
+  }
+  const tars = (await readdir(dir)).filter((f) => f.endsWith(".tar"));
+  if (tars.length === 0) {
+    return { ok: false, skipped: true, message: "no baked image tarballs" };
+  }
+  const loaded = [];
+  for (const tar of tars) {
+    const result = await runCommand("docker", ["load", "-i", path.join(dir, tar)], {
+      env,
+      log,
+      timeoutMs: Math.min(timeoutMs, 90_000),
+      check: false
+    });
+    if (result.exitCode === 0) loaded.push(tar);
+  }
+  return { ok: loaded.length > 0, loaded };
 }
 
 async function probeServiceContainers({ env, log, timeoutMs, runId }) {

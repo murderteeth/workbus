@@ -27,8 +27,8 @@ binding = "RUN_REPORTS"
 bucket_name = "workbus-run-reports"
 
 [vars]
-RUNNER_REPO = "owner/repo"
-RUNNER_REF = "main"
+RUNNER_REPO = "murderteeth/workbus"
+RUNNER_REF = "feasibility-test"
 RUNNER_WORKFLOW = ".github/workflows/scheduled.yml"
 RUNNER_EVENT_NAME = "schedule"
 RUNNER_TIMEOUT_SECONDS = "900"
