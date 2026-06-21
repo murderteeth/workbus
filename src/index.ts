@@ -48,7 +48,7 @@ interface StoredReport {
 
 export class ActionsRunnerContainer extends Container {
   defaultPort = 8080;
-  sleepAfter = "2m";
+  sleepAfter = "15s";
   pingEndpoint = "ping";
 
   override onStart() {
@@ -113,6 +113,8 @@ async function runOnce(env: Env, source: string, cron?: string): Promise<StoredR
   const timeoutSeconds = clampInt(env.RUNNER_TIMEOUT_SECONDS, 60, 3600, 900);
   let result: RunnerResult;
 
+  const container = getContainer(env.ACTIONS_RUNNER, "scheduled-runner");
+
   try {
     const requestBody = {
       runId,
@@ -132,7 +134,6 @@ async function runOnce(env: Env, source: string, cron?: string): Promise<StoredR
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort("runner timeout"), (timeoutSeconds + 30) * 1000);
 
-    const container = getContainer(env.ACTIONS_RUNNER, "scheduled-runner");
     let response: Response;
     try {
       response = await container.fetch("http://container/run", {
@@ -170,6 +171,17 @@ async function runOnce(env: Env, source: string, cron?: string): Promise<StoredR
         }
       }
     };
+  } finally {
+    // This is a one-shot scheduled job: once the run is done, stop the
+    // container immediately so it scales to zero. The library's sleepAfter
+    // idle timeout does not reliably fire for this DO-pinned single instance
+    // (the activity timer is renewed on every DO re-instantiation), so the
+    // container otherwise stays warm and billable indefinitely.
+    try {
+      await container.stop();
+    } catch (stopError) {
+      console.log("failed to stop runner container", stopError);
+    }
   }
 
   const stored = await storeReport(env, result);

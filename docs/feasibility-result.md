@@ -5,11 +5,15 @@ Live deployment to Cloudflare account `bbbd6770…1d5b`
 `standard-2`, targeting `murderteeth/workbus@feasibility-test`
 (`.github/workflows/scheduled.yml`, a minimal `act`-compatible job).
 
-## Verdict: VIABLE (with one real limitation + one ops constraint)
+## Verdict: VIABLE (with one real limitation)
 
-The core question — *can a Cloudflare Container run nested Docker well enough to
-execute `act`?* — is **YES**. A full `act` workflow ran end-to-end on the
-deployed Cloudflare Container.
+Two core questions, both now **YES**:
+1. *Can a Cloudflare Container run nested Docker well enough to execute `act`?* — a
+   full `act` workflow ran end-to-end on the deployed container.
+2. *Does it scale to zero so the cost model works?* — yes, after fixing a
+   PID-1 SIGTERM bug (see "Lifecycle" below); verified ~$0-1/month at hourly cron.
+
+Remaining real limitation: service-container DNS (likely fixable — see follow-up).
 
 ## Findings (from live runs)
 
@@ -24,6 +28,7 @@ deployed Cloudflare Container.
 | Secret injection + masking | ✅ works | secrets reach `act`; git auth header logs as `bearer ***`; raw token absent from log |
 | R2 reports/logs | ✅ works | `report.json` + `runner.log` written per run under `runs/<owner>/<repo>/…` |
 | GitHub commit status | ✅ works | `workbus/cloudflare-schedule: success` posted on head SHA |
+| Scale-to-zero / cost | ✅ works (after fix) | clean test: 1 run = ~40s active, then 8 idle minutes with **zero** billed usage. See "Lifecycle" below |
 | Timeout handling | ⊘ not stress-tested | `timeout.ok=true`; no deliberate-timeout run performed |
 | Artifacts | ⊘ not exercised | test workflow produces no artifacts (`artifacts.ok=false skipped=false`, expected) |
 
@@ -47,6 +52,31 @@ and `docker load`s it into the inner `dockerd` at runtime, with `act --pull=fals
 — eliminating the runtime pull entirely. Note: `*-slim` is intentionally minimal
 (Node + base OS, no `git`/`curl` preinstalled); workflows needing more tooling
 should bake a richer Debian runner image or fall back to `catthehacker`.
+
+## Lifecycle / scale-to-zero (the cost-critical finding)
+
+Initially the container **never scaled to zero** — billing analytics
+(`containersUsageAdaptiveGroups`) showed ~100% active time (≈59-60 active
+min/hour) despite one request/hour, projecting to **~$40-90/month** instead of
+the few dollars a scheduled job should cost.
+
+Root cause: `node server.js` runs as **PID 1**, which the kernel exempts from the
+default SIGTERM "terminate" disposition. With no handler installed, every stop
+signal was ignored — both the library's `sleepAfter` idle timeout *and* an
+explicit `stop()` send SIGTERM, and both did nothing. The container ran until the
+platform force-killed it (~28 min later). `sleepAfter` was a red herring.
+
+Fixes applied:
+- `runner/server.js` now handles SIGTERM/SIGINT and exits (PID-1-safe shutdown).
+- `src/index.ts` `runOnce` explicitly calls `container.stop()` in a `finally`
+  after each run — correct for a one-shot scheduled job, rather than relying on
+  the idle-timeout heuristic (which is also unreliable here: the activity timer
+  is renewed on every DO re-instantiation).
+
+Verified: a single run consumes ~40-75s of active time, then **zero** billed
+usage across the following idle minutes. Projected cost at hourly cron:
+**~$0-1/month marginal** (mostly within the free Memory/vCPU/disk allotments),
+plus the $5/month Workers Paid base.
 
 ## Follow-up (not yet done)
 

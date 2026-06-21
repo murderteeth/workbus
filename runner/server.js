@@ -11,7 +11,7 @@ const maxBodyBytes = 512 * 1024;
 const maxLogBytes = 1024 * 1024;
 const maxArtifactBytes = 5 * 1024 * 1024;
 
-createServer(async (req, res) => {
+const server = createServer(async (req, res) => {
   try {
     if (req.method === "GET" && req.url === "/ping") {
       return sendJson(res, 200, { ok: true });
@@ -30,9 +30,24 @@ createServer(async (req, res) => {
       error: error instanceof Error ? error.message : String(error)
     });
   }
-}).listen(port, "0.0.0.0", () => {
+});
+
+server.listen(port, "0.0.0.0", () => {
   console.log(`workbus runner listening on ${port}`);
 });
+
+// This process runs as PID 1 in the container. The kernel does NOT apply the
+// default "terminate" disposition to PID 1, so without these handlers SIGTERM
+// (sent by the Worker's stop()/sleepAfter) is ignored and the container never
+// exits — meaning it keeps billing until the platform eventually SIGKILLs it.
+// Handle the signals so the container actually scales to zero on stop.
+function shutdown(signal) {
+  console.log(`received ${signal}, shutting down`);
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 3000).unref();
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 async function runWorkflow(request) {
   const runId = request.runId || randomUUID();
