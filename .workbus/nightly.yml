@@ -1,0 +1,13 @@
+name: nightly
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+jobs:
+  nightly:
+    runs-on: ubuntu-latest
+    steps:
+      - name: announce
+        run: echo "workbus nightly run from .workbus/"
+      - name: environment
+        run: node -v && uname -a
