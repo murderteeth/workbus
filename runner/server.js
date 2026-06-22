@@ -455,8 +455,11 @@ function validateRequest(request) {
     throw new Error("repo must be owner/name");
   }
   if (!request.ref) throw new Error("ref is required");
-  if (!/^\.github\/workflows\/[^/]+\.(ya?ml)$/.test(request.workflow || "")) {
-    throw new Error("workflow must be a .github/workflows/*.yml file");
+  // Accept GitHub Actions workflows (.github/workflows/) and workbus-owned
+  // workflows (.workbus/). Moving a file into .workbus/ is how a repo opts a
+  // workflow into being run by workbus instead of GitHub Actions.
+  if (!/^(\.github\/workflows|\.workbus)\/[^/]+\.(ya?ml)$/.test(request.workflow || "")) {
+    throw new Error("workflow must be a .github/workflows/*.yml or .workbus/*.yml file");
   }
 }
 

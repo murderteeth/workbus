@@ -46,6 +46,32 @@ interface StoredReport {
   result: RunnerResult;
 }
 
+// A single unit of scheduled work: one workflow file in one repo at one ref,
+// plus the credentials/secrets it runs with. Today there is one job, built from
+// env (jobFromEnv). The control plane (D1 + `.workbus/` discovery) will produce
+// these from many repos without changing runJob.
+interface Job {
+  repo: string;
+  ref: string;
+  workflow: string;
+  eventName: string;
+  job?: string;
+  githubToken: string;
+  secrets: Record<string, string>;
+}
+
+function jobFromEnv(env: Env): Job {
+  return {
+    repo: env.RUNNER_REPO,
+    ref: env.RUNNER_REF,
+    workflow: env.RUNNER_WORKFLOW,
+    eventName: env.RUNNER_EVENT_NAME || "schedule",
+    job: env.RUNNER_JOB || undefined,
+    githubToken: env.GITHUB_TOKEN || "",
+    secrets: buildSecretMap(env)
+  };
+}
+
 export class ActionsRunnerContainer extends Container {
   defaultPort = 8080;
   sleepAfter = "15s";
@@ -91,12 +117,12 @@ export default {
     if (request.method === "POST" && url.pathname === "/run") {
       const unauthorized = authorizeManualRun(request, env);
       if (unauthorized) return unauthorized;
-      const stored = await runOnce(env, "manual");
+      const stored = await runJob(env, jobFromEnv(env), "manual");
       return Response.json(stored);
     }
 
     if (request.method === "POST" && url.pathname === "/cdn-cgi/handler/scheduled") {
-      const stored = await runOnce(env, "local-scheduled-test");
+      const stored = await runJob(env, jobFromEnv(env), "local-scheduled-test");
       return Response.json(stored);
     }
 
@@ -104,32 +130,34 @@ export default {
   },
 
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil(runOnce(env, "cron", controller.cron));
+    ctx.waitUntil(runJob(env, jobFromEnv(env), "cron", controller.cron));
   }
 };
 
-async function runOnce(env: Env, source: string, cron?: string): Promise<StoredReport> {
+async function runJob(env: Env, job: Job, source: string, cron?: string): Promise<StoredReport> {
   const runId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomUUID()}`;
   const timeoutSeconds = clampInt(env.RUNNER_TIMEOUT_SECONDS, 60, 3600, 900);
   let result: RunnerResult;
 
-  const container = getContainer(env.ACTIONS_RUNNER, "scheduled-runner");
+  // One container instance per run (keyed by runId) so concurrent jobs are
+  // isolated and each run cold-starts on the latest image, then scales to zero.
+  const container = getContainer(env.ACTIONS_RUNNER, runId);
 
   try {
     const requestBody = {
       runId,
       source,
       cron,
-      repo: env.RUNNER_REPO,
-      ref: env.RUNNER_REF,
-      workflow: env.RUNNER_WORKFLOW,
-      eventName: env.RUNNER_EVENT_NAME || "schedule",
-      job: env.RUNNER_JOB || undefined,
+      repo: job.repo,
+      ref: job.ref,
+      workflow: job.workflow,
+      eventName: job.eventName,
+      job: job.job,
       timeoutSeconds,
       enableDockerd: parseBool(env.RUNNER_ENABLE_DOCKERD, true),
       enableServiceProbe: parseBool(env.RUNNER_ENABLE_SERVICE_PROBE, true),
-      githubToken: env.GITHUB_TOKEN || "",
-      secrets: buildSecretMap(env)
+      githubToken: job.githubToken,
+      secrets: job.secrets
     };
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort("runner timeout"), (timeoutSeconds + 30) * 1000);
@@ -155,10 +183,10 @@ async function runOnce(env: Env, source: string, cron?: string): Promise<StoredR
   } catch (error) {
     result = {
       runId,
-      repo: env.RUNNER_REPO,
-      ref: env.RUNNER_REF,
-      workflow: env.RUNNER_WORKFLOW,
-      eventName: env.RUNNER_EVENT_NAME || "schedule",
+      repo: job.repo,
+      ref: job.ref,
+      workflow: job.workflow,
+      eventName: job.eventName,
       startedAt: new Date().toISOString(),
       completedAt: new Date().toISOString(),
       status: "error",

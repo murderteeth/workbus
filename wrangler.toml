@@ -12,7 +12,8 @@ crons = ["17 * * * *"]
 class_name = "ActionsRunnerContainer"
 image = "./Dockerfile"
 instance_type = "standard-2"
-max_instances = 1
+# One container instance per run (keyed by runId); allow several concurrent runs.
+max_instances = 5
 
 [[durable_objects.bindings]]
 name = "ACTIONS_RUNNER"
@@ -29,7 +30,7 @@ bucket_name = "workbus-run-reports"
 [vars]
 RUNNER_REPO = "murderteeth/workbus"
 RUNNER_REF = "feasibility-test"
-RUNNER_WORKFLOW = ".github/workflows/scheduled.yml"
+RUNNER_WORKFLOW = ".workbus/nightly.yml"
 RUNNER_EVENT_NAME = "schedule"
 RUNNER_TIMEOUT_SECONDS = "900"
 RUNNER_ENABLE_DOCKERD = "1"
