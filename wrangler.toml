@@ -27,6 +27,12 @@ new_sqlite_classes = ["ActionsRunnerContainer"]
 binding = "RUN_REPORTS"
 bucket_name = "workbus-run-reports"
 
+[[d1_databases]]
+binding = "DB"
+database_name = "workbus"
+database_id = "c4ad267d-6708-4669-ae1b-eb36b060006f"
+migrations_dir = "migrations"
+
 [vars]
 RUNNER_REPO = "murderteeth/workbus"
 RUNNER_REF = "feasibility-test"

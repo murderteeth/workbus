@@ -5,6 +5,7 @@ type RunStatus = "success" | "failure" | "error";
 interface Env {
   ACTIONS_RUNNER: DurableObjectNamespace<ActionsRunnerContainer>;
   RUN_REPORTS: R2Bucket;
+  DB: D1Database;
   RUNNER_REPO: string;
   RUNNER_REF: string;
   RUNNER_WORKFLOW: string;
@@ -105,13 +106,13 @@ export default {
     }
 
     if (request.method === "GET" && url.pathname === "/runs") {
-      return renderRunsList(env);
+      return renderRunsList(env, url);
     }
 
     if (request.method === "GET" && url.pathname === "/runs/view") {
-      const key = url.searchParams.get("key");
-      if (!key) return new Response("missing key", { status: 400 });
-      return renderRunDetail(env, key);
+      const id = url.searchParams.get("id");
+      if (!id) return new Response("missing id", { status: 400 });
+      return renderRunDetail(env, id);
     }
 
     if (request.method === "POST" && url.pathname === "/run") {
@@ -213,11 +214,53 @@ async function runJob(env: Env, job: Job, source: string, cron?: string): Promis
   }
 
   const stored = await storeReport(env, result);
+  await recordRun(env, result, stored, source);
   await Promise.allSettled([
     notifyGitHub(env, result, stored),
     notifySlack(env, result, stored)
   ]);
   return stored;
+}
+
+// Persist a run row to D1 for the history UI (alongside the R2 report/log).
+// Best-effort: a logging failure must not fail the run.
+async function recordRun(env: Env, result: RunnerResult, stored: StoredReport, source: string): Promise<void> {
+  try {
+    const f = (result.findings || {}) as Record<string, { ok?: boolean } | undefined>;
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO runs
+         (id, source, repo, ref, workflow, status, exit_code, head_sha,
+          started_at, completed_at, report_key, log_key, artifact_key,
+          docker_ok, act_ok, services_ok, findings_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        result.runId,
+        source,
+        result.repo,
+        result.ref ?? null,
+        result.workflow,
+        result.status,
+        result.exitCode ?? null,
+        result.headSha ?? null,
+        result.startedAt ?? null,
+        result.completedAt ?? null,
+        stored.reportKey,
+        stored.logKey,
+        stored.artifactKey ?? null,
+        boolToInt(f.docker?.ok),
+        boolToInt(f.act?.ok),
+        boolToInt(f.serviceContainers?.ok),
+        result.findings ? JSON.stringify(result.findings) : null
+      )
+      .run();
+  } catch (error) {
+    console.log("failed to record run in D1", error);
+  }
+}
+
+function boolToInt(value: boolean | undefined): number | null {
+  return value === undefined ? null : value ? 1 : 0;
 }
 
 async function storeReport(env: Env, result: RunnerResult): Promise<StoredReport> {
@@ -331,84 +374,110 @@ function clampInt(value: string | undefined, min: number, max: number, fallback:
   return Math.min(max, Math.max(min, parsed));
 }
 
-async function renderRunsList(env: Env): Promise<Response> {
-  const prefix = (env.RUNNER_R2_PREFIX || "runs").replace(/^\/+|\/+$/g, "") + "/";
-  const listed = await env.RUN_REPORTS.list({ prefix, limit: 1000 });
-  const reportKeys = listed.objects
-    .map((o) => o.key)
-    .filter((k) => k.endsWith("/report.json"))
-    .sort((a, b) => runIdOf(b).localeCompare(runIdOf(a)))
-    .slice(0, 50);
+interface RunRow {
+  id: string;
+  source: string | null;
+  repo: string;
+  ref: string | null;
+  workflow: string;
+  status: string;
+  exit_code: number | null;
+  head_sha: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  report_key: string | null;
+  log_key: string | null;
+  artifact_key: string | null;
+  docker_ok: number | null;
+  act_ok: number | null;
+  services_ok: number | null;
+  findings_json: string | null;
+}
 
-  const reports = await Promise.all(
-    reportKeys.map(async (key) => {
-      const obj = await env.RUN_REPORTS.get(key);
-      if (!obj) return undefined;
-      try {
-        return { key, report: (await obj.json()) as RunnerResult };
-      } catch {
-        return undefined;
-      }
-    })
-  );
+async function renderRunsList(env: Env, url: URL): Promise<Response> {
+  const limit = Math.min(200, Math.max(1, Number.parseInt(url.searchParams.get("limit") || "50", 10) || 50));
+  const offset = Math.max(0, Number.parseInt(url.searchParams.get("offset") || "0", 10) || 0);
+  const repo = url.searchParams.get("repo") || "";
+  const status = url.searchParams.get("status") || "";
 
-  const rows = reports
-    .filter((r): r is { key: string; report: RunnerResult } => Boolean(r))
-    .map(({ key, report }) => {
-      const f = (report.findings || {}) as Record<string, { ok?: boolean }>;
-      return `<tr>
-        <td>${esc(report.startedAt || "")}</td>
-        <td>${esc(report.repo || "")}</td>
-        <td>${esc(report.workflow || "")}</td>
-        <td>${statusBadge(report.status)}</td>
-        <td>${flag(f.docker?.ok)}</td>
-        <td>${flag(f.act?.ok)}</td>
-        <td>${flag(f.serviceContainers?.ok)}</td>
-        <td><a href="/runs/view?key=${encodeURIComponent(key)}">view</a></td>
-      </tr>`;
-    })
-    .join("\n");
+  const where: string[] = [];
+  const binds: unknown[] = [];
+  if (repo) { where.push("repo = ?"); binds.push(repo); }
+  if (status) { where.push("status = ?"); binds.push(status); }
+  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+  const { results } = await env.DB.prepare(
+    `SELECT id, repo, workflow, status, started_at, docker_ok, act_ok, services_ok
+       FROM runs ${whereSql}
+       ORDER BY started_at DESC
+       LIMIT ? OFFSET ?`
+  ).bind(...binds, limit, offset).all<RunRow>();
+
+  const rows = (results || []).map((r) => `<tr>
+        <td>${esc(r.started_at || "")}</td>
+        <td>${esc(r.repo || "")}</td>
+        <td>${esc(r.workflow || "")}</td>
+        <td>${statusBadge(r.status)}</td>
+        <td>${flag(intToBool(r.docker_ok))}</td>
+        <td>${flag(intToBool(r.act_ok))}</td>
+        <td>${flag(intToBool(r.services_ok))}</td>
+        <td><a href="/runs/view?id=${encodeURIComponent(r.id)}">view</a></td>
+      </tr>`).join("\n");
+
+  const qs = (o: number) => {
+    const p = new URLSearchParams();
+    if (repo) p.set("repo", repo);
+    if (status) p.set("status", status);
+    p.set("limit", String(limit));
+    p.set("offset", String(Math.max(0, o)));
+    return `/runs?${p.toString()}`;
+  };
+  const nav = `<p>
+      ${offset > 0 ? `<a href="${qs(offset - limit)}">&larr; newer</a>` : "newer"}
+      &nbsp;|&nbsp;
+      ${(results || []).length === limit ? `<a href="${qs(offset + limit)}">older &rarr;</a>` : "older"}
+    </p>`;
 
   const body = `<h1>workbus runs</h1>
-    <p>${reports.filter(Boolean).length} run(s), newest first.</p>
+    <p>showing ${(results || []).length} run(s)${repo ? ` for <code>${esc(repo)}</code>` : ""}${status ? ` with status <code>${esc(status)}</code>` : ""}, newest first.</p>
     <table>
       <thead><tr>
         <th>started</th><th>repo</th><th>workflow</th><th>status</th>
         <th>docker</th><th>act</th><th>services</th><th></th>
       </tr></thead>
       <tbody>${rows || `<tr><td colspan="8">no runs yet</td></tr>`}</tbody>
-    </table>`;
+    </table>
+    ${nav}`;
   return htmlResponse(body);
 }
 
-async function renderRunDetail(env: Env, reportKey: string): Promise<Response> {
-  const reportObj = await env.RUN_REPORTS.get(reportKey);
-  if (!reportObj) return new Response("run not found", { status: 404 });
-  const report = (await reportObj.json()) as RunnerResult;
+async function renderRunDetail(env: Env, id: string): Promise<Response> {
+  const run = await env.DB.prepare(`SELECT * FROM runs WHERE id = ?`).bind(id).first<RunRow>();
+  if (!run) return new Response("run not found", { status: 404 });
 
-  const logKey = reportKey.replace(/report\.json$/, "runner.log");
-  const logObj = await env.RUN_REPORTS.get(logKey);
+  let findings: unknown = {};
+  if (run.findings_json) {
+    try { findings = JSON.parse(run.findings_json); } catch { /* keep {} */ }
+  }
+
+  const logObj = run.log_key ? await env.RUN_REPORTS.get(run.log_key) : null;
   const log = logObj ? await logObj.text() : "(no log)";
 
-  const artifactKey = reportKey.replace(/report\.json$/, "artifacts.tgz");
-  const hasArtifact = Boolean(await env.RUN_REPORTS.head(artifactKey));
-
   const body = `<p><a href="/runs">&larr; all runs</a></p>
-    <h1>${esc(report.repo || "")} ${statusBadge(report.status)}</h1>
-    <p>${esc(report.workflow || "")} @ ${esc(report.ref || "")} &middot;
-       started ${esc(report.startedAt || "")} &middot; exit ${report.exitCode}
-       ${report.headSha ? `&middot; <code>${esc(report.headSha.slice(0, 12))}</code>` : ""}</p>
-    ${hasArtifact ? `<p>artifacts: <code>${esc(artifactKey)}</code> (in R2)</p>` : ""}
+    <h1>${esc(run.repo)} ${statusBadge(run.status)}</h1>
+    <p>${esc(run.workflow)} @ ${esc(run.ref || "")} &middot;
+       started ${esc(run.started_at || "")} &middot; exit ${run.exit_code ?? "?"}
+       ${run.head_sha ? `&middot; <code>${esc(run.head_sha.slice(0, 12))}</code>` : ""}</p>
+    ${run.artifact_key ? `<p>artifacts: <code>${esc(run.artifact_key)}</code> (in R2)</p>` : ""}
     <h2>findings</h2>
-    <pre>${esc(JSON.stringify(report.findings ?? {}, null, 2))}</pre>
+    <pre>${esc(JSON.stringify(findings, null, 2))}</pre>
     <h2>runner.log</h2>
     <pre>${esc(log)}</pre>`;
   return htmlResponse(body);
 }
 
-function runIdOf(reportKey: string): string {
-  const parts = reportKey.split("/");
-  return parts[parts.length - 2] || reportKey;
+function intToBool(value: number | null): boolean | undefined {
+  return value === null ? undefined : value !== 0;
 }
 
 function statusBadge(status?: string): string {
