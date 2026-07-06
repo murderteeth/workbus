@@ -1,4 +1,11 @@
 import { Container, getContainer } from "@cloudflare/containers";
+import {
+  type AppConfig,
+  exchangeManifestCode,
+  getInstallationToken,
+  ghHeaders,
+  verifyWebhookSignature
+} from "./github";
 
 type RunStatus = "success" | "failure" | "error";
 
@@ -20,6 +27,10 @@ interface Env {
   GITHUB_TOKEN?: string;
   GITHUB_STATUS_CONTEXT?: string;
   SLACK_WEBHOOK_URL?: string;
+  // GitHub App credentials (optional; override the D1 app_config row).
+  GITHUB_APP_ID?: string;
+  GITHUB_APP_PRIVATE_KEY?: string;
+  GITHUB_WEBHOOK_SECRET?: string;
 }
 
 interface RunnerResult {
@@ -113,6 +124,22 @@ export default {
       const id = url.searchParams.get("id");
       if (!id) return new Response("missing id", { status: 400 });
       return renderRunDetail(env, id);
+    }
+
+    if (request.method === "GET" && url.pathname === "/setup") {
+      return renderSetup(url);
+    }
+
+    if (request.method === "GET" && url.pathname === "/setup/callback") {
+      return handleSetupCallback(env, url);
+    }
+
+    if (request.method === "GET" && url.pathname === "/setup/status") {
+      return renderSetupStatus(env, url);
+    }
+
+    if (request.method === "POST" && url.pathname === "/webhooks/github") {
+      return handleWebhook(env, request);
     }
 
     if (request.method === "POST" && url.pathname === "/run") {
@@ -353,6 +380,157 @@ function buildSecretMap(env: Env): Record<string, string> {
     secrets.GITHUB_TOKEN = env.GITHUB_TOKEN;
   }
   return secrets;
+}
+
+// ===========================================================================
+//   GitHub App: setup (manifest flow), config, and webhooks
+// ===========================================================================
+
+// App credentials come from Worker secrets if set, otherwise the D1 app_config
+// row written by the /setup flow.
+async function loadAppConfig(env: Env): Promise<AppConfig | undefined> {
+  if (env.GITHUB_APP_ID && env.GITHUB_APP_PRIVATE_KEY) {
+    return {
+      appId: Number.parseInt(env.GITHUB_APP_ID, 10),
+      privateKey: env.GITHUB_APP_PRIVATE_KEY,
+      webhookSecret: env.GITHUB_WEBHOOK_SECRET
+    };
+  }
+  const row = await env.DB.prepare(
+    `SELECT app_id, private_key, webhook_secret, slug, client_id FROM app_config WHERE id = 1`
+  ).first<{ app_id: number; private_key: string; webhook_secret: string | null; slug: string | null; client_id: string | null }>();
+  if (!row) return undefined;
+  return {
+    appId: row.app_id,
+    privateKey: row.private_key,
+    webhookSecret: row.webhook_secret ?? undefined,
+    slug: row.slug ?? undefined,
+    clientId: row.client_id ?? undefined
+  };
+}
+
+// Renders an auto-submitting form that POSTs a GitHub App Manifest to GitHub,
+// which creates the App and redirects back to /setup/callback with a code.
+function renderSetup(url: URL): Response {
+  const base = url.origin;
+  const org = url.searchParams.get("org");
+  const action = org
+    ? `https://github.com/organizations/${encodeURIComponent(org)}/settings/apps/new`
+    : "https://github.com/settings/apps/new";
+  const manifest = {
+    name: `workbus-${crypto.randomUUID().slice(0, 8)}`,
+    url: base,
+    hook_attributes: { url: `${base}/webhooks/github`, active: true },
+    redirect_url: `${base}/setup/callback`,
+    public: false,
+    default_permissions: { contents: "read", metadata: "read", checks: "write" },
+    // installation / installation_repositories are automatic app-lifecycle
+    // events (always delivered) and are not valid in default_events.
+    default_events: ["push"]
+  };
+  const body = `<h1>Create the workbus GitHub App</h1>
+    <p>This creates a GitHub App${org ? ` in <code>${esc(org)}</code>` : " on your account"} with
+       read access to code + metadata and write access to checks, then returns here.
+       (Add <code>?org=YOUR_ORG</code> to create it in an organization.)</p>
+    <form id="f" method="post" action="${esc(action)}">
+      <input type="hidden" name="manifest" value="${esc(JSON.stringify(manifest))}">
+      <button type="submit">Create GitHub App</button>
+    </form>
+    <script>document.getElementById("f").submit()</script>`;
+  return htmlResponse(body);
+}
+
+async function handleSetupCallback(env: Env, url: URL): Promise<Response> {
+  const code = url.searchParams.get("code");
+  if (!code) return htmlResponse(`<h1>Setup error</h1><p>Missing <code>code</code>.</p>`);
+  let conv;
+  try {
+    conv = await exchangeManifestCode(code);
+  } catch (error) {
+    return htmlResponse(`<h1>Setup failed</h1><pre>${esc(error instanceof Error ? error.message : String(error))}</pre>`);
+  }
+  await env.DB.prepare(
+    `INSERT OR REPLACE INTO app_config (id, app_id, slug, private_key, webhook_secret, client_id, client_secret)
+     VALUES (1, ?, ?, ?, ?, ?, ?)`
+  ).bind(conv.id, conv.slug, conv.pem, conv.webhook_secret, conv.client_id, conv.client_secret).run();
+
+  const installUrl = `${conv.html_url}/installations/new`;
+  const body = `<h1>GitHub App created ✅</h1>
+    <p>App <code>${esc(conv.slug)}</code> (id ${conv.id}) is configured and stored.</p>
+    <p><a href="${esc(installUrl)}"><b>Install it on your repos →</b></a></p>
+    <p>After installing, add <code>.workbus/*.yml</code> files to those repos and they'll be scheduled by workbus.</p>
+    <details><summary>Harden (optional): store credentials as Worker secrets</summary>
+      <p>The App private key is currently in D1. For a stronger setup, set these as
+         Worker secrets (they take precedence over D1):</p>
+      <pre>wrangler secret put GITHUB_APP_ID          # ${conv.id}
+wrangler secret put GITHUB_APP_PRIVATE_KEY # the .pem
+wrangler secret put GITHUB_WEBHOOK_SECRET</pre>
+    </details>
+    <p><a href="/setup/status">setup status</a> &middot; <a href="/runs">runs</a></p>`;
+  return htmlResponse(body);
+}
+
+// Diagnostic: shows whether the App is configured and lists installations.
+// ?test_token=<installationId> mints a token and lists the repos it can see.
+async function renderSetupStatus(env: Env, url: URL): Promise<Response> {
+  const cfg = await loadAppConfig(env);
+  const insts = await env.DB.prepare(`SELECT id, account_login FROM installations ORDER BY id`).all<{ id: number; account_login: string | null }>();
+  let tokenTest = "";
+  const testId = url.searchParams.get("test_token");
+  if (testId && cfg) {
+    try {
+      const token = await getInstallationToken(cfg, Number.parseInt(testId, 10));
+      const res = await fetch("https://api.github.com/installation/repositories", { headers: ghHeaders(`Bearer ${token}`) });
+      const data = (await res.json()) as { total_count?: number; repositories?: { full_name: string }[] };
+      tokenTest = `<h2>token test (installation ${esc(testId)})</h2>
+        <p>minted ok; ${data.total_count ?? 0} repo(s): ${esc((data.repositories || []).map((r) => r.full_name).join(", "))}</p>`;
+    } catch (error) {
+      tokenTest = `<h2>token test failed</h2><pre>${esc(error instanceof Error ? error.message : String(error))}</pre>`;
+    }
+  }
+  const body = `<h1>workbus setup status</h1>
+    <p>App configured: <b>${cfg ? `yes (id ${cfg.appId}${cfg.slug ? `, ${esc(cfg.slug)}` : ""})` : "no"}</b>
+       ${cfg ? "" : `&middot; <a href="/setup">run setup</a>`}</p>
+    <h2>installations</h2>
+    <ul>${(insts.results || []).map((i) => `<li>${i.id} — ${esc(i.account_login || "")} &middot; <a href="/setup/status?test_token=${i.id}">test token</a></li>`).join("") || "<li>none yet</li>"}</ul>
+    ${tokenTest}`;
+  return htmlResponse(body);
+}
+
+async function handleWebhook(env: Env, request: Request): Promise<Response> {
+  const cfg = await loadAppConfig(env);
+  const raw = await request.arrayBuffer();
+  const sig = request.headers.get("x-hub-signature-256");
+  if (!cfg?.webhookSecret || !(await verifyWebhookSignature(cfg.webhookSecret, raw, sig))) {
+    return new Response("invalid signature", { status: 401 });
+  }
+  const event = request.headers.get("x-github-event") || "";
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(raw)) as Record<string, unknown>;
+  } catch {
+    return new Response("bad payload", { status: 400 });
+  }
+
+  if (event === "installation" || event === "installation_repositories") {
+    await handleInstallationEvent(env, payload);
+  }
+  // `push` (to .workbus/**) will trigger a catalog resync in M4.
+  console.log("github webhook", event, (payload as { action?: string }).action || "");
+  return new Response("ok");
+}
+
+async function handleInstallationEvent(env: Env, payload: Record<string, unknown>): Promise<void> {
+  const installation = payload.installation as { id?: number; account?: { login?: string } } | undefined;
+  if (!installation?.id) return;
+  const action = (payload.action as string) || "";
+  if (action === "deleted") {
+    await env.DB.prepare(`DELETE FROM installations WHERE id = ?`).bind(installation.id).run();
+    return;
+  }
+  await env.DB.prepare(`INSERT OR REPLACE INTO installations (id, account_login) VALUES (?, ?)`)
+    .bind(installation.id, installation.account?.login ?? null)
+    .run();
 }
 
 function authorizeManualRun(request: Request, env: Env): Response | undefined {
