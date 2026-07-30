@@ -356,9 +356,16 @@ async function checkoutRepo({ repo, ref, token, repoDir, log, timeoutMs, env }) 
   });
   const fetchArgs = ["fetch", "--depth=1", "origin", ref];
   const gitEnv = { ...env };
-  const command = token
-    ? ["-c", `http.https://github.com/${repo}.extraheader=AUTHORIZATION: bearer ${token}`, ...fetchArgs]
-    : fetchArgs;
+  // Authenticate with HTTP Basic using "x-access-token" as the username. This
+  // is required for GitHub App installation tokens (which are NOT accepted via
+  // "Authorization: bearer" for git) and also works for PATs. Mask the encoded
+  // credential so it never appears in the log.
+  let command = fetchArgs;
+  if (token) {
+    const basic = Buffer.from(`x-access-token:${token}`).toString("base64");
+    log.addMask(basic);
+    command = ["-c", `http.https://github.com/.extraheader=AUTHORIZATION: basic ${basic}`, ...fetchArgs];
+  }
   await runCommand("git", command, { cwd: repoDir, env: gitEnv, log, timeoutMs });
   await runCommand("git", ["checkout", "--detach", "FETCH_HEAD"], { cwd: repoDir, env, log, timeoutMs: 30_000 });
   const rev = await runCommand("git", ["rev-parse", "HEAD"], {
@@ -513,6 +520,10 @@ class LogBuffer {
 
   line(value) {
     this.write(`${value}\n`);
+  }
+
+  addMask(value) {
+    if (value) this.masks.push(String(value));
   }
 
   write(chunk) {

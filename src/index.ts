@@ -6,6 +6,7 @@ import {
   ghHeaders,
   verifyWebhookSignature
 } from "./github";
+import { listInstallationRepos, readWorkbusWorkflows } from "./discovery";
 
 type RunStatus = "success" | "failure" | "error";
 
@@ -138,8 +139,28 @@ export default {
       return renderSetupStatus(env, url);
     }
 
+    if (request.method === "GET" && url.pathname === "/setup/resync") {
+      const summary = await resyncCatalog(env);
+      return htmlResponse(`<h1>resync complete</h1>
+        <p>${summary.repos} repo(s), ${summary.jobs} job(s).</p>
+        <p><a href="/jobs">jobs</a> &middot; <a href="/setup/status">status</a></p>`);
+    }
+
+    if (request.method === "GET" && url.pathname === "/jobs") {
+      return renderJobs(env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/jobs/run") {
+      const unauthorized = authorizeManualRun(request, env);
+      if (unauthorized) return unauthorized;
+      const jobId = url.searchParams.get("id");
+      if (!jobId) return new Response("missing id", { status: 400 });
+      const stored = await runDiscoveredJob(env, jobId);
+      return stored ? Response.json(stored) : new Response("job not found or app not configured", { status: 404 });
+    }
+
     if (request.method === "POST" && url.pathname === "/webhooks/github") {
-      return handleWebhook(env, request);
+      return handleWebhook(env, request, ctx);
     }
 
     if (request.method === "POST" && url.pathname === "/run") {
@@ -497,7 +518,7 @@ async function renderSetupStatus(env: Env, url: URL): Promise<Response> {
   return htmlResponse(body);
 }
 
-async function handleWebhook(env: Env, request: Request): Promise<Response> {
+async function handleWebhook(env: Env, request: Request, ctx: ExecutionContext): Promise<Response> {
   const cfg = await loadAppConfig(env);
   const raw = await request.arrayBuffer();
   const sig = request.headers.get("x-hub-signature-256");
@@ -515,9 +536,19 @@ async function handleWebhook(env: Env, request: Request): Promise<Response> {
   if (event === "installation" || event === "installation_repositories") {
     await handleInstallationEvent(env, payload);
   }
-  // `push` (to .workbus/**) will trigger a catalog resync in M4.
+  // Keep the catalog fresh: repos added/removed, or a push that touches .workbus/.
+  if (event === "installation_repositories" || (event === "push" && pushTouchesWorkbus(payload))) {
+    ctx.waitUntil(resyncCatalog(env));
+  }
   console.log("github webhook", event, (payload as { action?: string }).action || "");
   return new Response("ok");
+}
+
+function pushTouchesWorkbus(payload: Record<string, unknown>): boolean {
+  const commits = (payload.commits as { added?: string[]; modified?: string[]; removed?: string[] }[]) || [];
+  return commits.some((c) =>
+    [...(c.added || []), ...(c.modified || []), ...(c.removed || [])].some((p) => p.startsWith(".workbus/"))
+  );
 }
 
 async function handleInstallationEvent(env: Env, payload: Record<string, unknown>): Promise<void> {
@@ -531,6 +562,129 @@ async function handleInstallationEvent(env: Env, payload: Record<string, unknown
   await env.DB.prepare(`INSERT OR REPLACE INTO installations (id, account_login) VALUES (?, ?)`)
     .bind(installation.id, installation.account?.login ?? null)
     .run();
+}
+
+// ===========================================================================
+//   Discovery: .workbus/ workflows across installed repos -> jobs
+// ===========================================================================
+
+// Walk every installation's repos, upsert repos + jobs from their .workbus/
+// directories, and drop jobs whose workflow file no longer exists.
+async function resyncCatalog(env: Env): Promise<{ repos: number; jobs: number }> {
+  const cfg = await loadAppConfig(env);
+  if (!cfg) return { repos: 0, jobs: 0 };
+
+  const installations = await env.DB.prepare(`SELECT id FROM installations`).all<{ id: number }>();
+  let repoCount = 0;
+  let jobCount = 0;
+
+  for (const inst of installations.results || []) {
+    const token = await getInstallationToken(cfg, inst.id);
+    const repos = await listInstallationRepos(token);
+    for (const repo of repos) {
+      await env.DB.prepare(
+        `INSERT OR REPLACE INTO repos (id, installation_id, full_name, default_branch) VALUES (?, ?, ?, ?)`
+      ).bind(repo.id, inst.id, repo.full_name, repo.default_branch).run();
+      repoCount += 1;
+
+      const specs = await readWorkbusWorkflows(token, repo.full_name, repo.default_branch);
+      const seen = new Set<string>();
+      for (const spec of specs) {
+        const jobId = `${repo.id}:${spec.path}`;
+        seen.add(spec.path);
+        // Store the first cron; multi-cron workflows are noted but not yet split.
+        if (spec.crons.length > 1) console.log(`job ${jobId} has ${spec.crons.length} crons; using the first`);
+        await env.DB.prepare(
+          `INSERT INTO jobs (id, repo_id, workflow_path, cron, manual_ok, enabled)
+             VALUES (?, ?, ?, ?, ?, 1)
+           ON CONFLICT(id) DO UPDATE SET
+             cron = excluded.cron, manual_ok = excluded.manual_ok, workflow_path = excluded.workflow_path`
+        ).bind(jobId, repo.id, spec.path, spec.crons[0] ?? null, spec.manualOk ? 1 : 0).run();
+        jobCount += 1;
+      }
+
+      const existing = await env.DB.prepare(`SELECT id, workflow_path FROM jobs WHERE repo_id = ?`)
+        .bind(repo.id).all<{ id: string; workflow_path: string }>();
+      for (const j of existing.results || []) {
+        if (!seen.has(j.workflow_path)) {
+          await env.DB.prepare(`DELETE FROM jobs WHERE id = ?`).bind(j.id).run();
+        }
+      }
+    }
+  }
+  return { repos: repoCount, jobs: jobCount };
+}
+
+interface JobRow {
+  id: string;
+  repo_id: number;
+  workflow_path: string;
+  cron: string | null;
+  manual_ok: number;
+  enabled: number;
+  full_name?: string;
+  default_branch?: string;
+  installation_id?: number;
+}
+
+// Build a runnable Job from a discovered jobs row, minting an installation token.
+async function runDiscoveredJob(env: Env, jobId: string): Promise<StoredReport | undefined> {
+  const cfg = await loadAppConfig(env);
+  if (!cfg) return undefined;
+  const row = await env.DB.prepare(
+    `SELECT j.id, j.workflow_path, r.full_name, r.default_branch, r.installation_id
+       FROM jobs j JOIN repos r ON r.id = j.repo_id
+      WHERE j.id = ?`
+  ).bind(jobId).first<JobRow>();
+  if (!row || !row.full_name || !row.installation_id || !row.default_branch) return undefined;
+
+  const token = await getInstallationToken(cfg, row.installation_id);
+  const job: Job = {
+    repo: row.full_name,
+    ref: row.default_branch,
+    workflow: row.workflow_path,
+    eventName: "schedule",
+    githubToken: token,
+    secrets: { GITHUB_TOKEN: token }
+  };
+  return runJob(env, job, "manual-job");
+}
+
+async function renderJobs(env: Env): Promise<Response> {
+  const { results } = await env.DB.prepare(
+    `SELECT j.id, j.workflow_path, j.cron, j.manual_ok, j.enabled, r.full_name
+       FROM jobs j JOIN repos r ON r.id = j.repo_id
+      ORDER BY r.full_name, j.workflow_path`
+  ).all<JobRow>();
+
+  const rows = (results || []).map((j) => `<tr>
+      <td>${esc(j.full_name || "")}</td>
+      <td>${esc(j.workflow_path)}</td>
+      <td>${j.cron ? `<code>${esc(j.cron)}</code>` : "—"}</td>
+      <td>${j.manual_ok ? "✅" : "—"}</td>
+      <td>${j.enabled ? "✅" : "—"}</td>
+      <td><button onclick="runJob('${esc(j.id)}')">run now</button></td>
+    </tr>`).join("\n");
+
+  const body = `<h1>workbus jobs</h1>
+    <p>discovered from <code>.workbus/</code> across installed repos &middot;
+       <a href="/setup/resync">resync</a> &middot; <a href="/runs">runs</a></p>
+    <table>
+      <thead><tr><th>repo</th><th>workflow</th><th>cron</th><th>manual</th><th>enabled</th><th></th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="6">no jobs yet — <a href="/setup/resync">resync</a></td></tr>`}</tbody>
+    </table>
+    <p id="msg"></p>
+    <script>
+      async function runJob(id){
+        const t = prompt("trigger token");
+        if(!t) return;
+        document.getElementById("msg").textContent = "running " + id + "...";
+        const r = await fetch("/jobs/run?id=" + encodeURIComponent(id), {method:"POST", headers:{authorization:"Bearer "+t}});
+        const j = await r.json().catch(()=>({}));
+        document.getElementById("msg").textContent = r.ok ? ("done: " + (j.result?.status||"?") + " — see /runs") : ("error " + r.status);
+      }
+    </script>`;
+  return htmlResponse(body);
 }
 
 function authorizeManualRun(request: Request, env: Env): Response | undefined {
