@@ -40,6 +40,13 @@ RUN mkdir -p /opt/runner-images \
 WORKDIR /app
 COPY runner/package.json runner/package-lock.json* ./
 RUN npm install --omit=dev
+
+# Reliably rebuild the runner COPY when runner/ content changes. BuildKit's COPY
+# content-hash cache is occasionally stale (ships an image missing the change);
+# RUNNER_HASH is a hash of runner/ set by scripts/deploy.sh, and changing this
+# RUN layer forces the COPY below to re-read the build context.
+ARG RUNNER_HASH=dev
+RUN echo "runner ${RUNNER_HASH}"
 COPY runner/ ./
 
 ENV PORT=8080
