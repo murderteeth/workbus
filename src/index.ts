@@ -7,13 +7,20 @@ import {
   verifyWebhookSignature
 } from "./github";
 import { listInstallationRepos, readWorkbusWorkflows } from "./discovery";
+import { cronMatches } from "./cron";
 
 type RunStatus = "success" | "failure" | "error";
+
+interface QueueMessage {
+  jobId: string;
+  scheduledFor: string;
+}
 
 interface Env {
   ACTIONS_RUNNER: DurableObjectNamespace<ActionsRunnerContainer>;
   RUN_REPORTS: R2Bucket;
   DB: D1Database;
+  QUEUE: Queue<QueueMessage>;
   RUNNER_REPO: string;
   RUNNER_REF: string;
   RUNNER_WORKFLOW: string;
@@ -178,10 +185,49 @@ export default {
     return new Response("not found", { status: 404 });
   },
 
-  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil(runJob(env, jobFromEnv(env), "cron", controller.cron));
+  // Minute tick: enqueue discovered jobs whose cron is due now.
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext) {
+    ctx.waitUntil(scheduleTick(env));
+  },
+
+  // Queue consumer: run one enqueued job, re-checking it still exists + is
+  // enabled at dispatch time (a job removed after enqueue is skipped).
+  async queue(batch: MessageBatch<QueueMessage>, env: Env, _ctx: ExecutionContext) {
+    for (const msg of batch.messages) {
+      const { jobId } = msg.body;
+      try {
+        const built = await buildJobFromId(env, jobId);
+        if (!built) {
+          console.log("queued job no longer exists, skipping", jobId);
+        } else if (!built.enabled) {
+          console.log("queued job disabled, skipping", jobId);
+        } else {
+          await runJob(env, built.job, "cron");
+        }
+      } catch (error) {
+        console.log("queued job run failed", jobId, error);
+      }
+      msg.ack();
+    }
   }
 };
+
+// Evaluate every enabled, scheduled job against the current minute and enqueue
+// those due. last_run_at (minute precision) dedups within a minute.
+async function scheduleTick(env: Env): Promise<void> {
+  const now = new Date();
+  const minute = now.toISOString().slice(0, 16);
+  const { results } = await env.DB.prepare(
+    `SELECT id, cron, last_run_at FROM jobs WHERE enabled = 1 AND cron IS NOT NULL AND cron != ''`
+  ).all<{ id: string; cron: string; last_run_at: string | null }>();
+
+  for (const job of results || []) {
+    if (!cronMatches(job.cron, now)) continue;
+    if (job.last_run_at && job.last_run_at.slice(0, 16) >= minute) continue;
+    await env.QUEUE.send({ jobId: job.id, scheduledFor: now.toISOString() });
+    await env.DB.prepare(`UPDATE jobs SET last_run_at = ? WHERE id = ?`).bind(now.toISOString(), job.id).run();
+  }
+}
 
 async function runJob(env: Env, job: Job, source: string, cron?: string): Promise<StoredReport> {
   const runId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomUUID()}`;
@@ -627,27 +673,38 @@ interface JobRow {
   installation_id?: number;
 }
 
-// Build a runnable Job from a discovered jobs row, minting an installation token.
-async function runDiscoveredJob(env: Env, jobId: string): Promise<StoredReport | undefined> {
+// Build a runnable Job from a discovered jobs row, minting an installation
+// token. Returns the job plus its enabled flag, or undefined if the job/repo/
+// app is missing (used by callers as a dispatch-time validity check).
+async function buildJobFromId(env: Env, jobId: string): Promise<{ job: Job; enabled: boolean } | undefined> {
   const cfg = await loadAppConfig(env);
   if (!cfg) return undefined;
   const row = await env.DB.prepare(
-    `SELECT j.id, j.workflow_path, r.full_name, r.default_branch, r.installation_id
+    `SELECT j.workflow_path, j.enabled, r.full_name, r.default_branch, r.installation_id
        FROM jobs j JOIN repos r ON r.id = j.repo_id
       WHERE j.id = ?`
   ).bind(jobId).first<JobRow>();
   if (!row || !row.full_name || !row.installation_id || !row.default_branch) return undefined;
 
   const token = await getInstallationToken(cfg, row.installation_id);
-  const job: Job = {
-    repo: row.full_name,
-    ref: row.default_branch,
-    workflow: row.workflow_path,
-    eventName: "schedule",
-    githubToken: token,
-    secrets: { GITHUB_TOKEN: token }
+  return {
+    enabled: row.enabled !== 0,
+    job: {
+      repo: row.full_name,
+      ref: row.default_branch,
+      workflow: row.workflow_path,
+      eventName: "schedule",
+      githubToken: token,
+      secrets: { GITHUB_TOKEN: token }
+    }
   };
-  return runJob(env, job, "manual-job");
+}
+
+// Manual run-now of a discovered job (runs regardless of enabled).
+async function runDiscoveredJob(env: Env, jobId: string): Promise<StoredReport | undefined> {
+  const built = await buildJobFromId(env, jobId);
+  if (!built) return undefined;
+  return runJob(env, built.job, "manual-job");
 }
 
 async function renderJobs(env: Env): Promise<Response> {

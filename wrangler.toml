@@ -6,7 +6,17 @@ compatibility_date = "2026-05-31"
 enabled = true
 
 [triggers]
-crons = ["17 * * * *"]
+# Scheduler tick: every minute, enqueue jobs whose cron is due.
+crons = ["* * * * *"]
+
+[[queues.producers]]
+binding = "QUEUE"
+queue = "workbus-runs"
+
+[[queues.consumers]]
+queue = "workbus-runs"
+max_batch_size = 10
+max_retries = 1
 
 [[containers]]
 class_name = "ActionsRunnerContainer"
