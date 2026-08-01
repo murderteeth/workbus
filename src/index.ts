@@ -8,6 +8,14 @@ import {
 } from "./github";
 import { listInstallationRepos, readWorkbusWorkflows } from "./discovery";
 import { cronMatches } from "./cron";
+import {
+  type Session,
+  parseCookies,
+  randomToken,
+  serializeCookie,
+  signSession,
+  verifySession
+} from "./auth";
 
 type RunStatus = "success" | "failure" | "error";
 
@@ -113,75 +121,62 @@ export class ActionsRunnerContainer extends Container {
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    const path = url.pathname;
 
-    if (request.method === "GET" && url.pathname === "/") {
-      return Response.json({
-        service: "workbus-scheduled-runner",
-        repo: env.RUNNER_REPO,
-        ref: env.RUNNER_REF,
-        workflow: env.RUNNER_WORKFLOW,
-        runs: "/runs"
-      });
+    // GitHub -> workbus webhook: always open (HMAC-verified inside).
+    if (request.method === "POST" && path === "/webhooks/github") {
+      return handleWebhook(env, request, ctx);
     }
 
-    if (request.method === "GET" && url.pathname === "/runs") {
-      return renderRunsList(env, url);
+    // Dashboard login flow.
+    if (request.method === "GET" && path === "/login") return startLogin(env, url);
+    if (request.method === "GET" && path === "/login/callback") return finishLogin(env, url, request);
+    if (request.method === "GET" && path === "/logout") return logout();
+
+    // Gate the dashboard behind a GitHub session. The API endpoints also accept
+    // the RUNNER_TRIGGER_TOKEN bearer. Exception: /setup before an App exists
+    // (bootstrap), so the deployer can create the App.
+    const configured = await isAppConfigured(env);
+    const session = await getSession(request, env);
+    const bearerOk = !!env.RUNNER_TRIGGER_TOKEN &&
+      (request.headers.get("authorization") || "") === `Bearer ${env.RUNNER_TRIGGER_TOKEN}`;
+    const bootstrap = !configured && (path === "/setup" || path === "/setup/callback");
+    if (!bootstrap && !session && !bearerOk) {
+      if (request.method === "GET") return Response.redirect(`${url.origin}/login`, 302);
+      return new Response("unauthorized", { status: 401 });
     }
 
-    if (request.method === "GET" && url.pathname === "/runs/view") {
+    if (request.method === "GET" && path === "/") return Response.redirect(`${url.origin}/jobs`, 302);
+    if (request.method === "GET" && path === "/runs") return renderRunsList(env, url);
+    if (request.method === "GET" && path === "/runs/view") {
       const id = url.searchParams.get("id");
       if (!id) return new Response("missing id", { status: 400 });
       return renderRunDetail(env, id);
     }
-
-    if (request.method === "GET" && url.pathname === "/setup") {
-      return renderSetup(url);
-    }
-
-    if (request.method === "GET" && url.pathname === "/setup/callback") {
-      return handleSetupCallback(env, url);
-    }
-
-    if (request.method === "GET" && url.pathname === "/setup/status") {
-      return renderSetupStatus(env, url);
-    }
-
-    if (request.method === "GET" && url.pathname === "/setup/resync") {
+    if (request.method === "GET" && path === "/setup") return renderSetup(url);
+    if (request.method === "GET" && path === "/setup/callback") return handleSetupCallback(env, url);
+    if (request.method === "GET" && path === "/setup/status") return renderSetupStatus(env, url);
+    if (request.method === "GET" && path === "/setup/resync") {
       const summary = await resyncCatalog(env);
       return htmlResponse(`<h1>resync complete</h1>
         <p>${summary.repos} repo(s), ${summary.jobs} job(s).</p>
         <p><a href="/jobs">jobs</a> &middot; <a href="/setup/status">status</a></p>`);
     }
-
-    if (request.method === "GET" && url.pathname === "/jobs") {
-      return renderJobs(env);
-    }
-
-    if (request.method === "POST" && url.pathname === "/jobs/run") {
-      const unauthorized = authorizeManualRun(request, env);
-      if (unauthorized) return unauthorized;
+    if (request.method === "GET" && path === "/jobs") return renderJobs(env);
+    if (request.method === "POST" && path === "/jobs/run") {
       const jobId = url.searchParams.get("id");
       if (!jobId) return new Response("missing id", { status: 400 });
       const stored = await runDiscoveredJob(env, jobId);
       return stored ? Response.json(stored) : new Response("job not found or app not configured", { status: 404 });
     }
-
-    if (request.method === "POST" && url.pathname === "/webhooks/github") {
-      return handleWebhook(env, request, ctx);
-    }
-
-    if (request.method === "POST" && url.pathname === "/run") {
-      const unauthorized = authorizeManualRun(request, env);
-      if (unauthorized) return unauthorized;
+    if (request.method === "POST" && path === "/run") {
       const stored = await runJob(env, jobFromEnv(env), "manual");
       return Response.json(stored);
     }
-
-    if (request.method === "POST" && url.pathname === "/cdn-cgi/handler/scheduled") {
+    if (request.method === "POST" && path === "/cdn-cgi/handler/scheduled") {
       const stored = await runJob(env, jobFromEnv(env), "local-scheduled-test");
       return Response.json(stored);
     }
-
     return new Response("not found", { status: 404 });
   },
 
@@ -489,6 +484,8 @@ function renderSetup(url: URL): Response {
     url: base,
     hook_attributes: { url: `${base}/webhooks/github`, active: true },
     redirect_url: `${base}/setup/callback`,
+    // OAuth callback for "Sign in with GitHub" on the dashboard.
+    callback_urls: [`${base}/login/callback`],
     public: false,
     default_permissions: { contents: "read", metadata: "read", checks: "write" },
     // installation / installation_repositories are automatic app-lifecycle
@@ -733,10 +730,8 @@ async function renderJobs(env: Env): Promise<Response> {
     <p id="msg"></p>
     <script>
       async function runJob(id){
-        const t = prompt("trigger token");
-        if(!t) return;
         document.getElementById("msg").textContent = "running " + id + "...";
-        const r = await fetch("/jobs/run?id=" + encodeURIComponent(id), {method:"POST", headers:{authorization:"Bearer "+t}});
+        const r = await fetch("/jobs/run?id=" + encodeURIComponent(id), {method:"POST"});
         const j = await r.json().catch(()=>({}));
         document.getElementById("msg").textContent = r.ok ? ("done: " + (j.result?.status||"?") + " — see /runs") : ("error " + r.status);
       }
@@ -744,12 +739,100 @@ async function renderJobs(env: Env): Promise<Response> {
   return htmlResponse(body);
 }
 
-function authorizeManualRun(request: Request, env: Env): Response | undefined {
-  if (!env.RUNNER_TRIGGER_TOKEN) return;
-  const header = request.headers.get("authorization") || "";
-  if (header !== `Bearer ${env.RUNNER_TRIGGER_TOKEN}`) {
-    return new Response("unauthorized", { status: 401 });
+// ===========================================================================
+//   Dashboard auth (Sign in with GitHub via the App's OAuth)
+// ===========================================================================
+
+interface WebAuth {
+  clientId: string;
+  clientSecret: string;
+  sessionSecret: string;
+}
+
+async function isAppConfigured(env: Env): Promise<boolean> {
+  const row = await env.DB.prepare(`SELECT 1 AS x FROM app_config WHERE id = 1`).first<{ x: number }>();
+  return Boolean(row);
+}
+
+// OAuth client creds + session-signing secret. The session secret is generated
+// and persisted lazily on first use.
+async function getWebAuth(env: Env): Promise<WebAuth | undefined> {
+  const row = await env.DB.prepare(
+    `SELECT client_id, client_secret, session_secret FROM app_config WHERE id = 1`
+  ).first<{ client_id: string | null; client_secret: string | null; session_secret: string | null }>();
+  if (!row || !row.client_id || !row.client_secret) return undefined;
+  let sessionSecret = row.session_secret;
+  if (!sessionSecret) {
+    sessionSecret = randomToken() + randomToken();
+    await env.DB.prepare(`UPDATE app_config SET session_secret = ? WHERE id = 1`).bind(sessionSecret).run();
   }
+  return { clientId: row.client_id, clientSecret: row.client_secret, sessionSecret };
+}
+
+async function getSession(request: Request, env: Env): Promise<Session | undefined> {
+  const wa = await getWebAuth(env);
+  if (!wa) return undefined;
+  const cookies = parseCookies(request.headers.get("cookie"));
+  return verifySession(wa.sessionSecret, cookies.wb_session);
+}
+
+async function startLogin(env: Env, url: URL): Promise<Response> {
+  const wa = await getWebAuth(env);
+  if (!wa) return htmlResponse(`<h1>workbus is not set up</h1><p>Run <a href="/setup">/setup</a> first.</p>`);
+  const state = randomToken();
+  const redirect = `${url.origin}/login/callback`;
+  const authorize = `https://github.com/login/oauth/authorize?client_id=${encodeURIComponent(wa.clientId)}` +
+    `&redirect_uri=${encodeURIComponent(redirect)}&state=${state}`;
+  return new Response(null, {
+    status: 302,
+    headers: { location: authorize, "set-cookie": serializeCookie("wb_oauth_state", state, { maxAge: 600 }) }
+  });
+}
+
+async function finishLogin(env: Env, url: URL, request: Request): Promise<Response> {
+  const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
+  const cookies = parseCookies(request.headers.get("cookie"));
+  if (!code || !state || state !== cookies.wb_oauth_state) {
+    return htmlResponse(`<h1>Login failed</h1><p>Invalid state — try <a href="/login">again</a>.</p>`, 400);
+  }
+  const wa = await getWebAuth(env);
+  if (!wa) return htmlResponse(`<h1>workbus is not set up</h1>`, 400);
+
+  const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
+    method: "POST",
+    headers: { accept: "application/json", "content-type": "application/json" },
+    body: JSON.stringify({ client_id: wa.clientId, client_secret: wa.clientSecret, code, redirect_uri: `${url.origin}/login/callback` })
+  });
+  const tokenData = (await tokenRes.json()) as { access_token?: string };
+  if (!tokenData.access_token) return htmlResponse(`<h1>Login failed</h1><p>Could not get a token.</p>`, 400);
+
+  const userRes = await fetch("https://api.github.com/user", { headers: ghHeaders(`Bearer ${tokenData.access_token}`) });
+  const login = ((await userRes.json()) as { login?: string }).login || "";
+
+  // Authorize: the user must share an installation with this App (i.e. belongs
+  // to an org / owns the account where workbus is installed).
+  const instRes = await fetch("https://api.github.com/user/installations", { headers: ghHeaders(`Bearer ${tokenData.access_token}`) });
+  const userInstallations = new Set(((await instRes.json()) as { installations?: { id: number }[] }).installations?.map((i) => i.id) || []);
+  const ours = await env.DB.prepare(`SELECT id FROM installations`).all<{ id: number }>();
+  const allowed = (ours.results || []).some((r) => userInstallations.has(r.id));
+  if (!allowed) {
+    return htmlResponse(`<h1>Access denied</h1><p><code>${esc(login)}</code> is not a member of an org where workbus is installed.</p>`, 403);
+  }
+
+  const session: Session = { login, exp: Math.floor(Date.now() / 1000) + 7 * 24 * 3600 };
+  const token = await signSession(wa.sessionSecret, session);
+  return new Response(null, {
+    status: 302,
+    headers: { location: "/jobs", "set-cookie": serializeCookie("wb_session", token, { maxAge: 7 * 24 * 3600 }) }
+  });
+}
+
+function logout(): Response {
+  return new Response(null, {
+    status: 302,
+    headers: { location: "/login", "set-cookie": serializeCookie("wb_session", "", { maxAge: 0 }) }
+  });
 }
 
 function parseBool(value: string | undefined, fallback: boolean): boolean {
@@ -887,9 +970,9 @@ function esc(value: string): string {
     .replaceAll('"', "&quot;");
 }
 
-function htmlResponse(body: string): Response {
+function htmlResponse(body: string, status = 200): Response {
   const html = `<!doctype html><html><head><meta charset="utf-8">
-    <title>workbus runs</title>
+    <title>workbus</title>
     <style>
       body{font:14px/1.5 system-ui,sans-serif;margin:2rem;color:#1f2328}
       table{border-collapse:collapse;width:100%}
@@ -898,8 +981,11 @@ function htmlResponse(body: string): Response {
       pre{background:#f6f8fa;padding:12px;border-radius:6px;overflow:auto;max-height:32rem}
       a{color:#0969da}
       code{background:#eff1f3;padding:1px 4px;border-radius:4px}
-    </style></head><body>${body}</body></html>`;
-  return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+      nav{margin-bottom:1rem;color:#57606a}
+    </style></head><body>
+    <nav><a href="/jobs">jobs</a> &middot; <a href="/runs">runs</a> &middot; <a href="/setup/status">setup</a> &middot; <a href="/logout">logout</a></nav>
+    ${body}</body></html>`;
+  return new Response(html, { status, headers: { "content-type": "text/html; charset=utf-8" } });
 }
 
 function base64ToBytes(value: string): Uint8Array {
