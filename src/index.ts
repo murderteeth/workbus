@@ -16,6 +16,7 @@ import {
   signSession,
   verifySession
 } from "./auth";
+import { decryptSecret, encryptSecret, isValidSecretName } from "./secrets";
 
 type RunStatus = "success" | "failure" | "error";
 
@@ -47,6 +48,8 @@ interface Env {
   GITHUB_APP_ID?: string;
   GITHUB_APP_PRIVATE_KEY?: string;
   GITHUB_WEBHOOK_SECRET?: string;
+  // 32-byte base64 master key for encrypting user workflow secrets.
+  SECRETS_MASTER_KEY?: string;
 }
 
 interface RunnerResult {
@@ -169,6 +172,9 @@ export default {
       const stored = await runDiscoveredJob(env, jobId);
       return stored ? Response.json(stored) : new Response("job not found or app not configured", { status: 404 });
     }
+    if (request.method === "GET" && path === "/secrets") return renderSecrets(env);
+    if (request.method === "POST" && path === "/secrets") return handleSetSecret(env, request, url);
+    if (request.method === "POST" && path === "/secrets/delete") return handleDeleteSecret(env, request, url);
     if (request.method === "POST" && path === "/run") {
       const stored = await runJob(env, jobFromEnv(env), "manual");
       return Response.json(stored);
@@ -191,7 +197,7 @@ export default {
     for (const msg of batch.messages) {
       const { jobId } = msg.body;
       try {
-        const built = await buildJobFromId(env, jobId);
+        const built = await buildJobFromId(env, jobId, "schedule");
         if (!built) {
           console.log("queued job no longer exists, skipping", jobId);
         } else if (!built.enabled) {
@@ -673,33 +679,128 @@ interface JobRow {
 // Build a runnable Job from a discovered jobs row, minting an installation
 // token. Returns the job plus its enabled flag, or undefined if the job/repo/
 // app is missing (used by callers as a dispatch-time validity check).
-async function buildJobFromId(env: Env, jobId: string): Promise<{ job: Job; enabled: boolean } | undefined> {
+async function buildJobFromId(env: Env, jobId: string, eventName: string): Promise<{ job: Job; enabled: boolean } | undefined> {
   const cfg = await loadAppConfig(env);
   if (!cfg) return undefined;
   const row = await env.DB.prepare(
-    `SELECT j.workflow_path, j.enabled, r.full_name, r.default_branch, r.installation_id
+    `SELECT j.repo_id, j.workflow_path, j.enabled, r.full_name, r.default_branch, r.installation_id
        FROM jobs j JOIN repos r ON r.id = j.repo_id
       WHERE j.id = ?`
   ).bind(jobId).first<JobRow>();
   if (!row || !row.full_name || !row.installation_id || !row.default_branch) return undefined;
 
   const token = await getInstallationToken(cfg, row.installation_id);
+  const repoSecrets = await loadRepoSecrets(env, row.repo_id);
   return {
     enabled: row.enabled !== 0,
     job: {
       repo: row.full_name,
       ref: row.default_branch,
       workflow: row.workflow_path,
-      eventName: "schedule",
+      eventName,
       githubToken: token,
-      secrets: { GITHUB_TOKEN: token }
+      // User secrets first; GITHUB_TOKEN is authoritative and cannot be
+      // overridden by a user secret of the same name.
+      secrets: { ...repoSecrets, GITHUB_TOKEN: token }
     }
   };
 }
 
-// Manual run-now of a discovered job (runs regardless of enabled).
+// Load and decrypt a repo's user secrets into a name->value map. Returns {}
+// (and logs) when the master key is absent or a value fails to decrypt.
+async function loadRepoSecrets(env: Env, repoId: number): Promise<Record<string, string>> {
+  if (!env.SECRETS_MASTER_KEY) return {};
+  const { results } = await env.DB.prepare(
+    `SELECT name, value_ref FROM secrets WHERE scope_repo_id = ?`
+  ).bind(repoId).all<{ name: string; value_ref: string }>();
+  const out: Record<string, string> = {};
+  for (const row of results || []) {
+    if (!isValidSecretName(row.name)) continue;
+    try {
+      out[row.name] = await decryptSecret(env.SECRETS_MASTER_KEY, row.value_ref);
+    } catch (error) {
+      console.log("failed to decrypt secret", row.name, error instanceof Error ? error.message : String(error));
+    }
+  }
+  return out;
+}
+
+// ===========================================================================
+//   Secrets management (repo-scoped, encrypted at rest)
+// ===========================================================================
+
+async function renderSecrets(env: Env): Promise<Response> {
+  const repos = await env.DB.prepare(`SELECT id, full_name FROM repos ORDER BY full_name`).all<{ id: number; full_name: string }>();
+  const secrets = await env.DB.prepare(`SELECT scope_repo_id, name FROM secrets ORDER BY name`).all<{ scope_repo_id: number; name: string }>();
+
+  const byRepo = new Map<number, string[]>();
+  for (const s of secrets.results || []) {
+    const list = byRepo.get(s.scope_repo_id) || [];
+    list.push(s.name);
+    byRepo.set(s.scope_repo_id, list);
+  }
+
+  const repoOptions = (repos.results || []).map((r) => `<option value="${r.id}">${esc(r.full_name)}</option>`).join("");
+  const repoBlocks = (repos.results || []).map((r) => {
+    const names = byRepo.get(r.id) || [];
+    const items = names.map((n) => `<li><code>${esc(n)}</code>
+        <form method="post" action="/secrets/delete" style="display:inline">
+          <input type="hidden" name="repo_id" value="${r.id}"><input type="hidden" name="name" value="${esc(n)}">
+          <button type="submit">delete</button>
+        </form></li>`).join("");
+    return `<h3>${esc(r.full_name)}</h3><ul>${items || "<li>no secrets</li>"}</ul>`;
+  }).join("");
+
+  const warn = env.SECRETS_MASTER_KEY
+    ? ""
+    : `<p style="color:#cf222e"><b>SECRETS_MASTER_KEY is not set</b> — setting secrets is disabled and existing secrets can't be decrypted.</p>`;
+
+  const body = `<h1>workbus secrets</h1>
+    <p>Repo-scoped secrets, encrypted at rest, injected into that repo's <code>.workbus/</code> runs
+       as <code>\${{ secrets.NAME }}</code>. Values are never shown after saving.</p>
+    ${warn}
+    <h2>add / update</h2>
+    <form method="post" action="/secrets">
+      <select name="repo_id" required>${repoOptions || `<option value="">no repos — resync first</option>`}</select>
+      <input name="name" placeholder="SECRET_NAME" pattern="[A-Z_][A-Z0-9_]*" title="A-Z, 0-9, underscore; must not start with a digit" required>
+      <input name="value" type="password" placeholder="value" autocomplete="off" required>
+      <button type="submit"${env.SECRETS_MASTER_KEY ? "" : " disabled"}>save</button>
+    </form>
+    <h2>existing</h2>
+    ${repoBlocks || "<p>no repos yet.</p>"}`;
+  return htmlResponse(body);
+}
+
+async function handleSetSecret(env: Env, request: Request, url: URL): Promise<Response> {
+  if (!env.SECRETS_MASTER_KEY) return htmlResponse(`<h1>Secrets disabled</h1><p><code>SECRETS_MASTER_KEY</code> is not set.</p>`, 400);
+  const form = await request.formData();
+  const repoId = Number.parseInt(String(form.get("repo_id") || ""), 10);
+  const name = String(form.get("name") || "").trim();
+  const value = String(form.get("value") || "");
+  if (!Number.isFinite(repoId) || !isValidSecretName(name) || value === "") {
+    return htmlResponse(`<h1>Invalid secret</h1><p>Name must match <code>[A-Z_][A-Z0-9_]*</code> and the value must be non-empty.</p><p><a href="/secrets">back</a></p>`, 400);
+  }
+  const ciphertext = await encryptSecret(env.SECRETS_MASTER_KEY, value);
+  await env.DB.prepare(
+    `INSERT OR REPLACE INTO secrets (id, scope_repo_id, scope_job_id, name, value_ref) VALUES (?, ?, NULL, ?, ?)`
+  ).bind(`${repoId}:${name}`, repoId, name, ciphertext).run();
+  return Response.redirect(`${url.origin}/secrets`, 303);
+}
+
+async function handleDeleteSecret(env: Env, request: Request, url: URL): Promise<Response> {
+  const form = await request.formData();
+  const repoId = Number.parseInt(String(form.get("repo_id") || ""), 10);
+  const name = String(form.get("name") || "");
+  if (Number.isFinite(repoId) && name) {
+    await env.DB.prepare(`DELETE FROM secrets WHERE id = ?`).bind(`${repoId}:${name}`).run();
+  }
+  return Response.redirect(`${url.origin}/secrets`, 303);
+}
+
+// Manual run-now of a discovered job (runs regardless of enabled). A manual run
+// is a workflow_dispatch, matching how `act` selects jobs by event.
 async function runDiscoveredJob(env: Env, jobId: string): Promise<StoredReport | undefined> {
-  const built = await buildJobFromId(env, jobId);
+  const built = await buildJobFromId(env, jobId, "workflow_dispatch");
   if (!built) return undefined;
   return runJob(env, built.job, "manual-job");
 }
@@ -983,7 +1084,7 @@ function htmlResponse(body: string, status = 200): Response {
       code{background:#eff1f3;padding:1px 4px;border-radius:4px}
       nav{margin-bottom:1rem;color:#57606a}
     </style></head><body>
-    <nav><a href="/jobs">jobs</a> &middot; <a href="/runs">runs</a> &middot; <a href="/setup/status">setup</a> &middot; <a href="/logout">logout</a></nav>
+    <nav><a href="/jobs">jobs</a> &middot; <a href="/runs">runs</a> &middot; <a href="/secrets">secrets</a> &middot; <a href="/setup/status">setup</a> &middot; <a href="/logout">logout</a></nav>
     ${body}</body></html>`;
   return new Response(html, { status, headers: { "content-type": "text/html; charset=utf-8" } });
 }
