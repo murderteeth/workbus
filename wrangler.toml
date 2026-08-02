@@ -6,13 +6,27 @@ compatibility_date = "2026-05-31"
 enabled = true
 
 [triggers]
-crons = ["17 * * * *"]
+# Scheduler tick: every minute, enqueue jobs whose cron is due.
+crons = ["* * * * *"]
+
+[[queues.producers]]
+binding = "QUEUE"
+queue = "workbus-runs"
+
+[[queues.consumers]]
+queue = "workbus-runs"
+max_batch_size = 10
+max_retries = 1
 
 [[containers]]
 class_name = "ActionsRunnerContainer"
 image = "./Dockerfile"
 instance_type = "standard-2"
-max_instances = 1
+# One container instance per run (keyed by runId); allow several concurrent runs.
+max_instances = 5
+# Build-time hash of runner/ (set by scripts/deploy.sh) so runner code changes
+# always rebuild the image; see Dockerfile RUNNER_HASH.
+image_vars = { RUNNER_HASH = "${RUNNER_HASH}" }
 
 [[durable_objects.bindings]]
 name = "ACTIONS_RUNNER"
@@ -26,10 +40,16 @@ new_sqlite_classes = ["ActionsRunnerContainer"]
 binding = "RUN_REPORTS"
 bucket_name = "workbus-run-reports"
 
+[[d1_databases]]
+binding = "DB"
+database_name = "workbus"
+database_id = "c4ad267d-6708-4669-ae1b-eb36b060006f"
+migrations_dir = "migrations"
+
 [vars]
-RUNNER_REPO = "owner/repo"
-RUNNER_REF = "main"
-RUNNER_WORKFLOW = ".github/workflows/scheduled.yml"
+RUNNER_REPO = "murderteeth/workbus"
+RUNNER_REF = "feasibility-test"
+RUNNER_WORKFLOW = ".workbus/nightly.yml"
 RUNNER_EVENT_NAME = "schedule"
 RUNNER_TIMEOUT_SECONDS = "900"
 RUNNER_ENABLE_DOCKERD = "1"

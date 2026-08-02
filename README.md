@@ -1,160 +1,147 @@
-# Workbus Scheduled Runner Prototype
+# workbus
 
-Prototype for replacing a narrow class of unreliable GitHub Actions `schedule`
-workflows with Cloudflare Cron Triggers plus Cloudflare Containers.
+Run your scheduled GitHub workflows on **Cloudflare Containers** instead of
+GitHub Actions. workbus is open source and **self-hosted**: you deploy it to your
+own Cloudflare account, install its GitHub App on your repos, and it runs the
+workflows you move into a `.workbus/` directory — on their own schedules,
+isolated per run, scaling to zero between runs.
 
-The scope is intentionally small:
+`.workbus/` is to workbus what `.github/workflows/` is to GitHub Actions. To move
+a scheduled workflow over:
 
-- One Cloudflare Worker.
-- One Cron Trigger.
-- One Cloudflare Container image.
-- One configured GitHub repository/ref.
-- One selected `.github/workflows/*.yml` workflow.
-- R2-backed run reports, logs, and small artifact bundles.
-- Optional GitHub commit status and Slack notifications.
-
-## Architecture
-
-1. Cloudflare Cron Trigger invokes `scheduled()` in `src/index.ts`.
-2. The Worker sends a run request to one named `ActionsRunnerContainer`.
-3. The container HTTP service in `runner/server.js`:
-   - probes Docker availability;
-   - optionally tries to start an inner `dockerd`;
-   - optionally probes Docker service-container style networking;
-   - checks out `RUNNER_REPO` at `RUNNER_REF`;
-   - writes selected secrets to an `act` secret file;
-   - runs the configured workflow with `act`;
-   - returns logs, findings, and a small artifact tarball to the Worker.
-4. The Worker writes `report.json`, `runner.log`, and optional `artifacts.tgz`
-   to R2.
-5. The Worker optionally posts a GitHub commit status and/or Slack webhook.
-
-## Key Feasibility Question
-
-`act` uses the Docker API to run workflow job containers and service containers.
-Cloudflare Containers can run Linux containers, but this prototype must prove
-whether nested Docker behavior works well enough for Actions-compatible
-execution. The runner reports these findings on every run:
-
-- `docker`: whether a Docker API is available or an inner `dockerd` can start.
-- `serviceContainers`: whether Docker networked service containers work.
-- `act`: whether `act` can execute the selected workflow.
-- `secrets`: which secret names were injected.
-- `logs`: whether logs were captured and returned.
-- `timeout`: whether the configured timeout was respected.
-- `artifacts`: whether small artifacts were bundled and stored in R2.
-- notifications: inferred from Worker logs and GitHub/Slack side effects.
-
-If `docker.ok` is false, this architecture is not viable for workflows that need
-normal Actions container execution. It may still be viable only for a narrower
-non-container runner mode or a custom shell-only executor.
-
-## Configure
-
-Edit `wrangler.toml`:
-
-```toml
-[triggers]
-crons = ["17 * * * *"]
-
-[vars]
-RUNNER_REPO = "owner/repo"
-RUNNER_REF = "main"
-RUNNER_WORKFLOW = ".github/workflows/scheduled.yml"
-RUNNER_EVENT_NAME = "schedule"
-RUNNER_TIMEOUT_SECONDS = "900"
-RUNNER_ENABLE_DOCKERD = "1"
-RUNNER_ENABLE_SERVICE_PROBE = "1"
-RUNNER_R2_PREFIX = "runs"
-GITHUB_STATUS_CONTEXT = "workbus/cloudflare-schedule"
+```bash
+git mv .github/workflows/nightly.yml .workbus/nightly.yml
+# set any secrets it needs in the workbus dashboard, then commit + push
 ```
 
-Create the R2 bucket:
+Moving the file **out** of `.github/workflows/` stops Actions from running it;
+moving it **into** `.workbus/` makes workbus pick it up. The file's location is
+the single source of truth for who runs it — clean cutover, no double execution.
+
+Workflows run with [`act`](https://github.com/nektos/act), so most `schedule`-
+driven, `act`-compatible workflows work with no changes beyond re-providing their
+secrets. See [Compatibility](#compatibility--limitations).
+
+## How it works
+
+```
+GitHub App (installed on your repos)
+   │  contents:read, metadata:read, checks:write, webhooks
+   ▼
+Cloudflare Worker (src/index.ts)
+   ├─ /setup        create the App via a manifest flow
+   ├─ /webhooks     push / installation events → resync the .workbus/ catalog
+   ├─ discovery     list repos → read .workbus/*.yml → parse on.schedule → D1 jobs
+   ├─ scheduler     minute cron tick → jobs due now → Queue
+   └─ dashboard     /jobs /runs /secrets (Sign in with GitHub)
+   ▼
+Cloudflare Queue (workbus-runs)
+   ▼
+per-run Container (runner/server.js): mint installation token → checkout →
+   run the workflow with act → report to R2 + D1, post a GitHub check
+```
+
+- **Discovery** finds every `.workbus/*.yml` across your installed repos and turns
+  each into a job (schedule taken from the file's `on.schedule` cron).
+- **Scheduling** is a one-minute cron tick that enqueues jobs whose cron is due.
+- **Execution** happens in a fresh Cloudflare Container per run — isolated,
+  cold-started on the current image, then stopped so it bills only while running
+  (~seconds per run).
+- **Secrets** you set in the dashboard are AES-256-GCM encrypted at rest and
+  injected into runs as `${{ secrets.NAME }}`, masked in logs.
+
+The feasibility work behind this (nested Docker on Cloudflare Containers, cost,
+scale-to-zero) is written up in [`docs/feasibility-result.md`](docs/feasibility-result.md).
+
+## Self-hosting
+
+**Prerequisites:** a Cloudflare account on the **Workers Paid** plan (Containers
+require it), `wrangler`, Node, and a GitHub org/account you can install an App on.
+
+### 1. Create the Cloudflare resources
 
 ```bash
 npx wrangler r2 bucket create workbus-run-reports
+npx wrangler d1 create workbus          # put the printed database_id into wrangler.toml
+npx wrangler d1 migrations apply workbus --remote
+npx wrangler queues create workbus-runs
 ```
 
-Set secrets:
+### 2. Set secrets
 
 ```bash
-npx wrangler secret put GITHUB_TOKEN
-npx wrangler secret put RUNNER_TRIGGER_TOKEN
-npx wrangler secret put RUNNER_SECRETS_JSON
-npx wrangler secret put SLACK_WEBHOOK_URL
+# Master key for encrypting workflow secrets (required for the secrets feature)
+openssl rand -base64 32 | npx wrangler secret put SECRETS_MASTER_KEY
+# Bearer token for the run/API endpoints (optional; enables headless automation)
+openssl rand -hex 24   | npx wrangler secret put RUNNER_TRIGGER_TOKEN
 ```
 
-`RUNNER_SECRETS_JSON` is optional JSON for workflow secrets, for example:
-
-```json
-{"NPM_TOKEN":"...","API_KEY":"..."}
-```
-
-`GITHUB_TOKEN` is used for private checkout, passed to `act` as
-`GITHUB_TOKEN`, and used by the Worker to create a commit status.
-
-## Run
-
-Install dependencies and typecheck:
+### 3. Deploy
 
 ```bash
 npm install
-(cd runner && npm install)
-npm run typecheck
+npm run deploy   # scripts/deploy.sh: hashes runner/ into RUNNER_HASH so a changed
+                 # runner always rebuilds the image, and rolls out immediately
 ```
 
-Local Worker cron simulation:
+### 4. Create + install the GitHub App
+
+Visit `https://<your-worker-host>/setup` (add `?org=YOUR_ORG` to create it in an
+org). It runs GitHub's **App Manifest** flow — one click creates the App in your
+account with the right permissions, and workbus stores its credentials. Then
+follow the **Install** link and choose the repos workbus should manage.
+
+The App is created with an OAuth callback (`/login/callback`) so you can sign in
+to the dashboard. Once installed, workbus discovers `.workbus/` files
+automatically (on push) — or hit `/setup/resync` to force a scan.
+
+### 5. Migrate a workflow
+
+In a managed repo: `git mv .github/workflows/<wf>.yml .workbus/<wf>.yml`, set its
+secrets under **/secrets** in the dashboard, commit, and push. It appears under
+**/jobs** and runs on its schedule. Use **run now** to validate it first.
+
+## Dashboard
+
+Gated by "Sign in with GitHub" (you must belong to an org / own an account where
+the App is installed). API endpoints also accept `Authorization: Bearer
+$RUNNER_TRIGGER_TOKEN`.
+
+- **`/jobs`** — discovered `.workbus/` workflows, their crons, and **run now**.
+- **`/runs`**, **`/runs/view?id=…`** — run history, findings, and logs (from D1/R2).
+- **`/secrets`** — set/delete repo-scoped secrets (values never shown after saving).
+- **`/setup/status`** — App + installations; **`/setup/resync`** — rescan `.workbus/`.
+
+## Compatibility & limitations
+
+workbus runs workflows with `act`, which covers most simple scheduled workflows
+but is not a 1:1 GitHub Actions replacement. Known gaps are tracked as issues:
+
+- `services:` containers — [#2](../../issues/2)
+- non-schedule triggers (push / pull_request) — [#3](../../issues/3)
+- `actions/cache` — [#4](../../issues/4) · OIDC — [#5](../../issues/5)
+- non-default-branch discovery — [#6](../../issues/6)
+- multiple crons per workflow — [#8](../../issues/8)
+- multi-tenant SaaS mode — [#1](../../issues/1)
+
+Best fit today: **schedule-driven, `act`-compatible workflows that don't need
+`services:` networking**, using runner images small enough to run in-container
+(the default is a baked Debian image).
+
+## Development
 
 ```bash
-npm run dev
-curl "http://localhost:8787/cdn-cgi/handler/scheduled"
+npm install
+npm run typecheck      # tsc --noEmit
+npm run dev            # local Worker (wrangler dev)
+npm run deploy         # build + deploy (see scripts/deploy.sh)
 ```
 
-Manual deployed run:
+Layout: `src/index.ts` (Worker: routing, scheduler, dashboard), `src/github.ts`
+(App JWT + installation tokens + webhooks), `src/discovery.ts` (`.workbus/`
+catalog), `src/cron.ts` (schedule matching), `src/auth.ts` (dashboard sessions),
+`src/secrets.ts` (secret encryption), `runner/server.js` (in-container runner),
+`migrations/` (D1 schema).
 
-```bash
-curl -X POST \
-  -H "Authorization: Bearer $RUNNER_TRIGGER_TOKEN" \
-  "https://<worker-host>/run"
-```
-
-Deploy:
-
-```bash
-npm run deploy
-```
-
-After a run, inspect R2 keys under:
-
-```text
-runs/<owner>/<repo>/.github_workflows_<workflow>/<run-id>/
-```
-
-## Pass/Fail Criteria
-
-Pass for becoming a real internal scheduler:
-
-- Container starts from Cron reliably.
-- Checkout succeeds for the configured repo/ref.
-- `docker.ok` and `serviceContainers.ok` are true.
-- `act.ok` is true for the selected workflow.
-- Report and log objects are present in R2.
-- Secrets are available to the workflow without appearing in logs.
-- Timeout failures produce an R2 report and notification.
-- GitHub status or Slack notification is delivered.
-
-Fail or redesign:
-
-- Inner Docker cannot start and no Docker socket/API is available.
-- Service-container networking fails for workflows that need services.
-- Worker-to-container request lifetime is too short for expected jobs.
-- Artifact output is too large for the Worker response path.
-- Required secrets cannot be injected safely.
-
-## Current Assumptions
-
-- The prototype is for a trusted internal workflow, not arbitrary untrusted code.
-- The selected workflow is expected to run on Linux amd64.
-- Artifacts are capped at 5 MiB in this prototype and returned inline to the
-  Worker before being stored in R2.
-- R2 reports are private unless a separate public/custom-domain layer is added.
+The `RUNNER_*` vars in `wrangler.toml` drive only the legacy single-job `/run`
+test endpoint; real jobs come from `.workbus/` discovery.

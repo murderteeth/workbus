@@ -5,15 +5,17 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "deploy": "wrangler deploy",
+    "deploy": "bash scripts/deploy.sh",
     "dev": "wrangler dev",
     "cf-typegen": "wrangler types"
   },
   "dependencies": {
-    "@cloudflare/containers": "0.3.4"
+    "@cloudflare/containers": "0.3.4",
+    "js-yaml": "^4.3.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "4.20260524.1",
+    "@types/js-yaml": "^4.0.9",
     "typescript": "^5.9.3",
     "wrangler": "4.94.0"
   }

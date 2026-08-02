@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -11,7 +11,7 @@ const maxBodyBytes = 512 * 1024;
 const maxLogBytes = 1024 * 1024;
 const maxArtifactBytes = 5 * 1024 * 1024;
 
-createServer(async (req, res) => {
+const server = createServer(async (req, res) => {
   try {
     if (req.method === "GET" && req.url === "/ping") {
       return sendJson(res, 200, { ok: true });
@@ -30,9 +30,24 @@ createServer(async (req, res) => {
       error: error instanceof Error ? error.message : String(error)
     });
   }
-}).listen(port, "0.0.0.0", () => {
+});
+
+server.listen(port, "0.0.0.0", () => {
   console.log(`workbus runner listening on ${port}`);
 });
+
+// This process runs as PID 1 in the container. The kernel does NOT apply the
+// default "terminate" disposition to PID 1, so without these handlers SIGTERM
+// (sent by the Worker's stop()/sleepAfter) is ignored and the container never
+// exits — meaning it keeps billing until the platform eventually SIGKILLs it.
+// Handle the signals so the container actually scales to zero on stop.
+function shutdown(signal) {
+  console.log(`received ${signal}, shutting down`);
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 3000).unref();
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 async function runWorkflow(request) {
   const runId = request.runId || randomUUID();
@@ -76,6 +91,14 @@ async function runWorkflow(request) {
       env.DOCKER_HOST = dockerProbe.dockerHost;
     }
     findings.docker = dockerProbe.finding;
+
+    if (findings.docker.ok) {
+      findings.bakedImages = await loadBakedImages({
+        env,
+        log,
+        timeoutMs: remaining(deadline, 120_000)
+      });
+    }
 
     if (request.enableServiceProbe && findings.docker.ok) {
       findings.serviceContainers = await probeServiceContainers({
@@ -138,7 +161,10 @@ async function runWorkflow(request) {
       "--artifact-server-path",
       artifactsDir,
       "--container-architecture",
-      "linux/amd64"
+      "linux/amd64",
+      "--pull=false",
+      "-P",
+      "ubuntu-latest=node:22-bookworm-slim"
     ];
     if (request.job) {
       actArgs.push("-j", request.job);
@@ -267,6 +293,28 @@ async function ensureDocker({ enabled, env, log, timeoutMs }) {
   return { finding, process: dockerd, dockerHost };
 }
 
+async function loadBakedImages({ env, log, timeoutMs }) {
+  const dir = "/opt/runner-images";
+  if (!existsSync(dir)) {
+    return { ok: false, skipped: true, message: "no baked image directory" };
+  }
+  const tars = (await readdir(dir)).filter((f) => f.endsWith(".tar"));
+  if (tars.length === 0) {
+    return { ok: false, skipped: true, message: "no baked image tarballs" };
+  }
+  const loaded = [];
+  for (const tar of tars) {
+    const result = await runCommand("docker", ["load", "-i", path.join(dir, tar)], {
+      env,
+      log,
+      timeoutMs: Math.min(timeoutMs, 90_000),
+      check: false
+    });
+    if (result.exitCode === 0) loaded.push(tar);
+  }
+  return { ok: loaded.length > 0, loaded };
+}
+
 async function probeServiceContainers({ env, log, timeoutMs, runId }) {
   const network = `workbus-${runId}`.replace(/[^a-zA-Z0-9_.-]/g, "-").slice(0, 60);
   const service = `${network}-svc`;
@@ -308,9 +356,16 @@ async function checkoutRepo({ repo, ref, token, repoDir, log, timeoutMs, env }) 
   });
   const fetchArgs = ["fetch", "--depth=1", "origin", ref];
   const gitEnv = { ...env };
-  const command = token
-    ? ["-c", `http.https://github.com/${repo}.extraheader=AUTHORIZATION: bearer ${token}`, ...fetchArgs]
-    : fetchArgs;
+  // Authenticate with HTTP Basic using "x-access-token" as the username. This
+  // is required for GitHub App installation tokens (which are NOT accepted via
+  // "Authorization: bearer" for git) and also works for PATs. Mask the encoded
+  // credential so it never appears in the log.
+  let command = fetchArgs;
+  if (token) {
+    const basic = Buffer.from(`x-access-token:${token}`).toString("base64");
+    log.addMask(basic);
+    command = ["-c", `http.https://github.com/.extraheader=AUTHORIZATION: basic ${basic}`, ...fetchArgs];
+  }
   await runCommand("git", command, { cwd: repoDir, env: gitEnv, log, timeoutMs });
   await runCommand("git", ["checkout", "--detach", "FETCH_HEAD"], { cwd: repoDir, env, log, timeoutMs: 30_000 });
   const rev = await runCommand("git", ["rev-parse", "HEAD"], {
@@ -407,8 +462,11 @@ function validateRequest(request) {
     throw new Error("repo must be owner/name");
   }
   if (!request.ref) throw new Error("ref is required");
-  if (!/^\.github\/workflows\/[^/]+\.(ya?ml)$/.test(request.workflow || "")) {
-    throw new Error("workflow must be a .github/workflows/*.yml file");
+  // Accept GitHub Actions workflows (.github/workflows/) and workbus-owned
+  // workflows (.workbus/). Moving a file into .workbus/ is how a repo opts a
+  // workflow into being run by workbus instead of GitHub Actions.
+  if (!/^(\.github\/workflows|\.workbus)\/[^/]+\.(ya?ml)$/.test(request.workflow || "")) {
+    throw new Error("workflow must be a .github/workflows/*.yml or .workbus/*.yml file");
   }
 }
 
@@ -462,6 +520,10 @@ class LogBuffer {
 
   line(value) {
     this.write(`${value}\n`);
+  }
+
+  addMask(value) {
+    if (value) this.masks.push(String(value));
   }
 
   write(chunk) {

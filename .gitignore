@@ -2,5 +2,10 @@ node_modules/
 .wrangler/
 dist/
 .dev.vars
+.cf.env
 runner-work/
 *.log
+
+# local feasibility-test scratch output
+run*.json
+report.json
